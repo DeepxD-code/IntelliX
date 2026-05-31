@@ -1,0 +1,75 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+.container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+
+header { text-align: center; margin-bottom: 24px; }
+header h1 { font-size: 2rem; font-weight: 700; background: linear-gradient(135deg, #60a5fa, #a78bfa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+.subtitle { color: #94a3b8; margin-top: 4px; font-size: 0.9rem; }
+.model-badge { margin-top: 8px; font-size: 0.8rem; color: #64748b; background: #1e293b; display: inline-block; padding: 4px 14px; border-radius: 20px; border: 1px solid #334155; }
+.model-badge span { color: #60a5fa; font-weight: 600; }
+
+.main-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; min-height: 600px; }
+
+.input-panel { display: flex; flex-direction: column; background: #1e293b; border-radius: 12px; border: 1px solid #334155; overflow: hidden; }
+.toolbar { display: flex; gap: 8px; padding: 12px; background: #1a2332; border-bottom: 1px solid #334155; flex-wrap: wrap; }
+.toolbar select, .toolbar button { font-size: 0.85rem; }
+.toolbar select { background: #0f172a; color: #e2e8f0; border: 1px solid #334155; border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+.toolbar select:focus { outline: none; border-color: #60a5fa; }
+
+.btn-primary { background: #2563eb; color: #fff; border: none; border-radius: 6px; padding: 6px 16px; font-weight: 600; cursor: pointer; transition: background 0.15s; margin-left: auto; }
+.btn-primary:hover { background: #1d4ed8; }
+.btn-secondary { background: #334155; color: #cbd5e1; border: 1px solid #475569; border-radius: 6px; padding: 6px 12px; cursor: pointer; transition: background 0.15s; }
+.btn-secondary:hover { background: #475569; }
+
+textarea#codeInput { flex: 1; background: #0f172a; color: #e2e8f0; border: none; padding: 16px; font-family: 'Cascadia Code', 'JetBrains Mono', 'Fira Code', monospace; font-size: 0.85rem; line-height: 1.6; resize: none; min-height: 400px; tab-size: 4; }
+textarea#codeInput:focus { outline: none; }
+textarea#codeInput::placeholder { color: #475569; }
+
+.status-bar { display: flex; justify-content: space-between; padding: 8px 16px; background: #1a2332; border-top: 1px solid #334155; font-size: 0.8rem; color: #94a3b8; }
+
+.results-panel { background: #1e293b; border-radius: 12px; border: 1px solid #334155; padding: 24px; overflow-y: auto; max-height: 700px; position: relative; }
+.empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; min-height: 400px; text-align: center; }
+.empty-icon { font-size: 3rem; color: #334155; font-weight: 700; margin-bottom: 16px; }
+.empty-state h3 { color: #64748b; margin-bottom: 8px; }
+.empty-state p { color: #475569; max-width: 360px; font-size: 0.9rem; line-height: 1.5; }
+
+.results-header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+.results-header h2 { font-size: 1.3rem; font-weight: 600; }
+
+.prediction-badge { padding: 4px 14px; border-radius: 20px; font-size: 0.8rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+.prediction-badge.efficient { background: rgba(34,197,94,0.15); color: #22c55e; border: 1px solid rgba(34,197,94,0.3); }
+.prediction-badge.moderate { background: rgba(250,204,21,0.15); color: #eab308; border: 1px solid rgba(250,204,21,0.3); }
+.prediction-badge.needs_optimization { background: rgba(239,68,68,0.15); color: #ef4444; border: 1px solid rgba(239,68,68,0.3); }
+
+.confidence { font-size: 1.1rem; font-weight: 700; color: #60a5fa; margin-left: auto; }
+
+.metrics-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; margin-bottom: 20px; }
+.metric-card { background: #0f172a; border-radius: 8px; padding: 12px; text-align: center; border: 1px solid #1e293b; }
+.metric-value { font-size: 1.2rem; font-weight: 700; color: #e2e8f0; }
+.metric-unit { font-size: 0.75rem; color: #64748b; font-weight: 400; }
+.metric-label { font-size: 0.7rem; color: #64748b; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+.probabilities-section, .recommendations-section { margin-top: 20px; }
+.probabilities-section h3, .recommendations-section h3 { font-size: 0.9rem; color: #94a3b8; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+.prob-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.prob-label { width: 130px; font-size: 0.8rem; color: #cbd5e1; text-align: right; }
+.prob-bar-track { flex: 1; height: 18px; background: #0f172a; border-radius: 9px; overflow: hidden; }
+.prob-bar-fill { height: 100%; border-radius: 9px; transition: width 0.5s ease; }
+.prob-bar-fill.efficient { background: linear-gradient(90deg, #22c55e, #16a34a); }
+.prob-bar-fill.moderate { background: linear-gradient(90deg, #eab308, #ca8a04); }
+.prob-bar-fill.needs_optimization { background: linear-gradient(90deg, #ef4444, #dc2626); }
+.prob-pct { width: 50px; text-align: right; font-size: 0.8rem; font-weight: 600; color: #94a3b8; }
+
+.recommendations-section ul { list-style: none; }
+.recommendations-section li { padding: 8px 12px; background: #0f172a; border-radius: 6px; margin-bottom: 6px; font-size: 0.85rem; color: #cbd5e1; border-left: 3px solid #60a5fa; }
+.recommendations-section li.no-recs { border-left-color: #334155; color: #64748b; }
+
+.loading { display: none; text-align: center; padding: 100px 0; }
+.spinner { width: 40px; height: 40px; border: 3px solid #334155; border-top-color: #60a5fa; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 16px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.loading p { color: #64748b; font-size: 0.9rem; }
+
+.error-display { display: none; padding: 20px; background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.3); border-radius: 8px; color: #ef4444; font-size: 0.9rem; }
+
+@media (max-width: 900px) { .main-layout { grid-template-columns: 1fr; } }

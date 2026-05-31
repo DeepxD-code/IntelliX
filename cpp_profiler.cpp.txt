@@ -1,0 +1,363 @@
+/*
+ * IntelliProfile - C++ Low-Level Profiler
+ * High-precision performance measurement and static code analysis
+ */
+
+#include <iostream>
+#include <chrono>
+#include <string>
+#include <vector>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+#include <cmath>
+
+using namespace std;
+using namespace std::chrono;
+
+// Structure to hold profiling metrics
+struct ProfileMetrics {
+    string functionName;
+    double executionTime;  // in milliseconds
+    size_t memoryUsage;    // in bytes
+    int loopDepth;
+    int functionCalls;
+    string code;
+};
+
+class CPPProfiler {
+private:
+    vector<ProfileMetrics> metrics;
+    high_resolution_clock::time_point startTime;
+    
+public:
+    // Start high-precision timer
+    void startTimer() {
+        startTime = high_resolution_clock::now();
+    }
+    
+    // Stop timer and return elapsed time in milliseconds
+    double stopTimer() {
+        auto endTime = high_resolution_clock::now();
+        duration<double, milli> elapsed = endTime - startTime;
+        return elapsed.count();
+    }
+    
+    // Analyze loop depth by counting nested braces
+    int analyzeLoopDepth(const string& code) {
+        int maxDepth = 0;
+        int currentDepth = 0;
+        bool inLoop = false;
+        
+        // Look for loop keywords
+        size_t pos = 0;
+        while (pos < code.length()) {
+            // Check for loop keywords
+            if (code.substr(pos, 3) == "for" || 
+                code.substr(pos, 5) == "while" ||
+                code.substr(pos, 2) == "do") {
+                inLoop = true;
+            }
+            
+            // Count braces
+            if (code[pos] == '{' && inLoop) {
+                currentDepth++;
+                maxDepth = max(maxDepth, currentDepth);
+            } else if (code[pos] == '}' && inLoop) {
+                currentDepth--;
+                if (currentDepth == 0) {
+                    inLoop = false;
+                }
+            }
+            pos++;
+        }
+        
+        return maxDepth;
+    }
+    
+    // Count function calls (simplified - counts parentheses pairs)
+    int countFunctionCalls(const string& code) {
+        int count = 0;
+        for (size_t i = 0; i < code.length(); i++) {
+            if (code[i] == '(' && i > 0 && isalpha(code[i-1])) {
+                count++;
+            }
+        }
+        return count;
+    }
+    
+    // Estimate memory usage based on code patterns
+    size_t estimateMemory(const string& code) {
+        size_t memory = 0;
+        
+        // Count arrays and vectors
+        size_t arrayCount = 0;
+        size_t pos = code.find("vector");
+        while (pos != string::npos) {
+            arrayCount++;
+            pos = code.find("vector", pos + 1);
+        }
+        
+        pos = code.find("[");
+        while (pos != string::npos) {
+            arrayCount++;
+            pos = code.find("[", pos + 1);
+        }
+        
+        // Rough estimate: each array/vector uses ~1KB
+        memory = arrayCount * 1024;
+        
+        // Base memory for function stack
+        memory += 256;
+        
+        return memory;
+    }
+    
+    // Profile a code snippet
+    ProfileMetrics profileCode(const string& functionName, const string& code, 
+                               void (*func)()) {
+        ProfileMetrics metrics;
+        metrics.functionName = functionName;
+        metrics.code = code;
+        
+        // Static analysis
+        metrics.loopDepth = analyzeLoopDepth(code);
+        metrics.functionCalls = countFunctionCalls(code);
+        metrics.memoryUsage = estimateMemory(code);
+        
+        // Dynamic profiling
+        startTimer();
+        func();  // Execute the function
+        metrics.executionTime = stopTimer();
+        
+        this->metrics.push_back(metrics);
+        return metrics;
+    }
+    
+    // Export metrics to JSON format
+    void exportToJSON(const string& filename) {
+        ofstream outFile(filename);
+        
+        outFile << "[\n";
+        for (size_t i = 0; i < metrics.size(); i++) {
+            outFile << "  {\n";
+            outFile << "    \"language\": \"C++\",\n";
+            outFile << "    \"function_name\": \"" << metrics[i].functionName << "\",\n";
+            outFile << "    \"execution_time\": " << metrics[i].executionTime << ",\n";
+            outFile << "    \"memory_usage\": " << metrics[i].memoryUsage << ",\n";
+            outFile << "    \"loop_depth\": " << metrics[i].loopDepth << ",\n";
+            outFile << "    \"function_calls\": " << metrics[i].functionCalls << "\n";
+            outFile << "  }";
+            if (i < metrics.size() - 1) {
+                outFile << ",";
+            }
+            outFile << "\n";
+        }
+        outFile << "]\n";
+        
+        outFile.close();
+        cout << "\nMetrics exported to " << filename << endl;
+    }
+    
+    // Print metrics to console
+    void printMetrics(const ProfileMetrics& m) {
+        cout << "\n========================================\n";
+        cout << "C++ Profiler - Performance Metrics\n";
+        cout << "========================================\n";
+        cout << "Function: " << m.functionName << "\n";
+        cout << "Execution Time: " << m.executionTime << " ms\n";
+        cout << "Memory Usage: " << m.memoryUsage << " bytes\n";
+        cout << "Loop Depth: " << m.loopDepth << "\n";
+        cout << "Function Calls: " << m.functionCalls << "\n";
+        cout << "========================================\n";
+    }
+    
+    // Print all collected metrics
+    void printAllMetrics() {
+        for (const auto& m : metrics) {
+            printMetrics(m);
+        }
+    }
+};
+
+// ============= Test Functions =============
+
+// Test 1: Simple efficient function
+void simpleSum() {
+    int sum = 0;
+    for (int i = 0; i < 1000; i++) {
+        sum += i;
+    }
+}
+
+// Test 2: Nested loops (inefficient)
+void nestedLoops() {
+    int matrix[100][100];
+    for (int i = 0; i < 100; i++) {
+        for (int j = 0; j < 100; j++) {
+            matrix[i][j] = i * j;
+        }
+    }
+}
+
+// Test 3: Triple nested loops (very inefficient)
+void tripleNestedLoops() {
+    int cube[50][50][50];
+    for (int i = 0; i < 50; i++) {
+        for (int j = 0; j < 50; j++) {
+            for (int k = 0; k < 50; k++) {
+                cube[i][j][k] = i + j + k;
+            }
+        }
+    }
+}
+
+// Test 4: Efficient algorithm with low loop depth
+void efficientSearch() {
+    vector<int> arr(1000);
+    for (int i = 0; i < 1000; i++) {
+        arr[i] = i;
+    }
+    // Binary search simulation
+    int target = 500;
+    int left = 0, right = 999;
+    while (left <= right) {
+        int mid = (left + right) / 2;
+        if (arr[mid] == target) break;
+        if (arr[mid] < target) left = mid + 1;
+        else right = mid - 1;
+    }
+}
+
+// Test 5: Matrix multiplication (moderate complexity)
+void matrixMultiply() {
+    const int N = 100;
+    int A[N][N], B[N][N], C[N][N];
+    
+    // Initialize
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            A[i][j] = i + j;
+            B[i][j] = i - j;
+            C[i][j] = 0;
+        }
+    }
+    
+    // Multiply
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            for (int k = 0; k < N; k++) {
+                C[i][j] += A[i][k] * B[k][j];
+            }
+        }
+    }
+}
+
+// ============= Main Demo =============
+
+int main() {
+    CPPProfiler profiler;
+    
+    cout << "IntelliProfile - C++ Profiler Module\n";
+    cout << "====================================\n\n";
+    
+    // Test 1: Simple efficient code
+    cout << "Test 1: Profiling Simple Loop...\n";
+    string code1 = R"(
+void simpleSum() {
+    int sum = 0;
+    for (int i = 0; i < 1000; i++) {
+        sum += i;
+    }
+}
+)";
+    ProfileMetrics m1 = profiler.profileCode("simpleSum", code1, simpleSum);
+    profiler.printMetrics(m1);
+    
+    // Test 2: Nested loops
+    cout << "\nTest 2: Profiling Nested Loops...\n";
+    string code2 = R"(
+void nestedLoops() {
+    int matrix[100][100];
+    for (int i = 0; i < 100; i++) {
+        for (int j = 0; j < 100; j++) {
+            matrix[i][j] = i * j;
+        }
+    }
+}
+)";
+    ProfileMetrics m2 = profiler.profileCode("nestedLoops", code2, nestedLoops);
+    profiler.printMetrics(m2);
+    
+    // Test 3: Triple nested loops
+    cout << "\nTest 3: Profiling Triple Nested Loops...\n";
+    string code3 = R"(
+void tripleNestedLoops() {
+    int cube[50][50][50];
+    for (int i = 0; i < 50; i++) {
+        for (int j = 0; j < 50; j++) {
+            for (int k = 0; k < 50; k++) {
+                cube[i][j][k] = i + j + k;
+            }
+        }
+    }
+}
+)";
+    ProfileMetrics m3 = profiler.profileCode("tripleNestedLoops", code3, tripleNestedLoops);
+    profiler.printMetrics(m3);
+    
+    // Test 4: Efficient search
+    cout << "\nTest 4: Profiling Efficient Search...\n";
+    string code4 = R"(
+void efficientSearch() {
+    vector<int> arr(1000);
+    for (int i = 0; i < 1000; i++) {
+        arr[i] = i;
+    }
+    int target = 500;
+    int left = 0, right = 999;
+    while (left <= right) {
+        int mid = (left + right) / 2;
+        if (arr[mid] == target) break;
+        if (arr[mid] < target) left = mid + 1;
+        else right = mid - 1;
+    }
+}
+)";
+    ProfileMetrics m4 = profiler.profileCode("efficientSearch", code4, efficientSearch);
+    profiler.printMetrics(m4);
+    
+    // Test 5: Matrix multiplication
+    cout << "\nTest 5: Profiling Matrix Multiplication...\n";
+    string code5 = R"(
+void matrixMultiply() {
+    const int N = 100;
+    int A[N][N], B[N][N], C[N][N];
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            A[i][j] = i + j;
+            B[i][j] = i - j;
+            C[i][j] = 0;
+        }
+    }
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            for (int k = 0; k < N; k++) {
+                C[i][j] += A[i][k] * B[k][j];
+            }
+        }
+    }
+}
+)";
+    ProfileMetrics m5 = profiler.profileCode("matrixMultiply", code5, matrixMultiply);
+    profiler.printMetrics(m5);
+    
+    // Export all metrics to JSON
+    profiler.exportToJSON("cpp_metrics.json");
+    
+    cout << "\n====================================\n";
+    cout << "Profiling Complete!\n";
+    cout << "====================================\n";
+    
+    return 0;
+}
