@@ -1,23 +1,21 @@
-import ast, os, sys, json, random, math, time, hashlib, logging
+import ast
+import json
+import logging
+import os
+import random
 from datetime import datetime
-from typing import Dict, List, Tuple, Any, Optional
-from dataclasses import dataclass, field, asdict
+from typing import Any
 
+import joblib
 import numpy as np
 import pandas as pd
 import yaml
-import joblib
-
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.svm import SVC
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from sklearn.model_selection import GridSearchCV, StratifiedKFold, cross_val_score, train_test_split
 from sklearn.neural_network import MLPClassifier
-from sklearn.model_selection import (
-    train_test_split, cross_val_score, StratifiedKFold, GridSearchCV
-)
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score, classification_report, confusion_matrix
-)
 from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
 
 # =============================================================================
 # 0. CONFIGURATION MANAGEMENT
@@ -168,7 +166,7 @@ class PythonASTAnalyzer(ast.NodeVisitor):
     def visit_SetComp(self, node): self._visit_comp(node, 'set')
     def visit_DictComp(self, node): self._visit_comp(node, 'dict')
 
-    def analyze(self, code: str) -> Dict[str, Any]:
+    def analyze(self, code: str) -> dict[str, Any]:
         tree = ast.parse(code)
         self.visit(tree)
         return self.metrics
@@ -240,7 +238,7 @@ def _generate_python_snippet(complexity: str) -> str:
     pool = SNIPPETS.get(complexity, SNIPPETS['EFFICIENT'])
     return random.choice(pool)
 
-def _compute_synthetic_metrics(code: str, noise: float = 0.15) -> Dict[str, float]:
+def _compute_synthetic_metrics(code: str, noise: float = 0.15) -> dict[str, float]:
     analyzer = PythonASTAnalyzer()
     try:
         m = analyzer.analyze(code)
@@ -338,7 +336,7 @@ class MLPipeline:
         self.inv_label_map = {v: k for k, v in self.label_map.items()}
         os.makedirs(self.MODEL_DIR, exist_ok=True)
 
-    def train(self, df: pd.DataFrame, tune: bool = True, cv_folds: int = 5) -> Dict[str, float]:
+    def train(self, df: pd.DataFrame, tune: bool = True, cv_folds: int = 5) -> dict[str, float]:
         X = df[FEATURE_COLUMNS].values
         y = df['label_encoded'].values
 
@@ -384,7 +382,7 @@ class MLPipeline:
         logger.info(f"Trained {self.classifier_type}: acc={self.accuracy:.4f}, f1={self.f1:.4f}, params={best_params}")
         return results
 
-    def predict(self, metrics: Dict[str, float]) -> Tuple[str, float, Dict[str, float]]:
+    def predict(self, metrics: dict[str, float]) -> tuple[str, float, dict[str, float]]:
         if self.model is None or self.scaler is None:
             raise RuntimeError("Model not trained or loaded.")
         features = np.array([[metrics.get(c, 0.0) for c in FEATURE_COLUMNS]])
@@ -445,7 +443,7 @@ class ModelRegistry:
         self.registry_dir = registry_dir or os.path.join(os.path.dirname(__file__), 'models')
         os.makedirs(self.registry_dir, exist_ok=True)
 
-    def list_versions(self) -> List[Dict[str, Any]]:
+    def list_versions(self) -> list[dict[str, Any]]:
         versions = {}
         for f in os.listdir(self.registry_dir):
             if f.startswith('model_v') and f.endswith('_meta.json'):
@@ -455,7 +453,7 @@ class ModelRegistry:
                 versions[v] = meta
         return [{'version': v, **meta} for v, meta in sorted(versions.items())]
 
-    def get_latest_version(self) -> Optional[str]:
+    def get_latest_version(self) -> str | None:
         versions = self.list_versions()
         return versions[-1]['version'] if versions else None
 
@@ -489,7 +487,7 @@ DEFAULT_RECOMMENDATIONS = {
 }
 
 
-def generate_recommendations(metrics: Dict[str, float], label: str, config: ConfigManager = None) -> List[str]:
+def generate_recommendations(metrics: dict[str, float], label: str, config: ConfigManager = None) -> list[str]:
     recs = list(DEFAULT_RECOMMENDATIONS.get(label, []))
     t = config.get if config else lambda k, d=None: d
 
@@ -516,11 +514,11 @@ def generate_recommendations(metrics: Dict[str, float], label: str, config: Conf
 class CodeProfiler:
     """Unified entry point for profiling code across languages."""
 
-    def __init__(self, ml: Optional[MLPipeline] = None, config: Optional[ConfigManager] = None):
+    def __init__(self, ml: MLPipeline | None = None, config: ConfigManager | None = None):
         self.ml = ml
         self.config = config
 
-    def profile_python(self, code: str) -> Dict[str, Any]:
+    def profile_python(self, code: str) -> dict[str, Any]:
         analyzer = PythonASTAnalyzer()
         try:
             ast_metrics = analyzer.analyze(code)
@@ -548,7 +546,7 @@ class CodeProfiler:
             'complexity_score': complexity_score,
         }
 
-    def profile_cpp(self, code: str) -> Dict[str, Any]:
+    def profile_cpp(self, code: str) -> dict[str, Any]:
         lines = code.split('\n')
         loop_depth = 0; max_depth = 0; func_calls = 0
         in_loop = False; current_depth = 0
@@ -577,7 +575,7 @@ class CodeProfiler:
             'conditionals': conditionals, 'complexity_score': complexity,
         }
 
-    def profile_java(self, code: str) -> Dict[str, Any]:
+    def profile_java(self, code: str) -> dict[str, Any]:
         loops = code.count('for') + code.count('while') + code.count('do ')
         conditionals = code.count('if') + code.count('switch') + code.count('else')
         method_calls = sum(1 for i, ch in enumerate(code) if ch == '(' and i > 0 and code[i-1].isalpha())
@@ -592,14 +590,14 @@ class CodeProfiler:
             'complexity_score': round(complexity * 0.5 + exec_time * 0.3 + (memory / 1024) * 0.2, 2),
         }
 
-    def profile(self, code: str, language: str = 'python') -> Dict[str, Any]:
+    def profile(self, code: str, language: str = 'python') -> dict[str, Any]:
         language = language.lower()
         if language == 'python': return self.profile_python(code)
         elif language == 'cpp': return self.profile_cpp(code)
         elif language == 'java': return self.profile_java(code)
         else: return {'error': f'Unsupported language: {language}'}
 
-    def analyze(self, code: str, language: str = 'python') -> Dict[str, Any]:
+    def analyze(self, code: str, language: str = 'python') -> dict[str, Any]:
         metrics = self.profile(code, language)
         if 'error' in metrics:
             return metrics
@@ -622,7 +620,7 @@ class CodeProfiler:
             result['recommendations'] = generate_recommendations(metrics, label, self.config)
         return result
 
-    def export_json(self, results: List[Dict[str, Any]], filepath: str = 'profile_results.json'):
+    def export_json(self, results: list[dict[str, Any]], filepath: str = 'profile_results.json'):
         with open(filepath, 'w') as f:
             json.dump(results, f, indent=2)
         return filepath
@@ -632,7 +630,7 @@ class CodeProfiler:
 # 6. DEMO / CLI ENTRY POINT
 # =============================================================================
 
-def print_report(result: Dict[str, Any]):
+def print_report(result: dict[str, Any]):
     metrics = result.get('metrics', {}); pred = result.get('ml_prediction', {}); recs = result.get('recommendations', [])
     lang = metrics.get('language', '?').upper()
     print(f"\n{'='*50}")
@@ -652,13 +650,13 @@ def print_report(result: Dict[str, Any]):
         for k, v in pred['probabilities'].items():
             print(f"    {k:>25}: {v*100:5.1f}%")
     if recs:
-        print(f"\n  Recommendations:")
+        print("\n  Recommendations:")
         for r in recs:
             print(f"    • {r}")
     print(f"{'='*50}\n")
 
 
-def run_comparison(df: pd.DataFrame) -> Dict[str, Any]:
+def run_comparison(df: pd.DataFrame) -> dict[str, Any]:
     """Compare all classifier types and return the best one."""
     from copy import deepcopy
     results = {}
@@ -704,7 +702,7 @@ def main():
 
     profiler = CodeProfiler(ml, config)
 
-    print(f"\n[4/4] Running sample profiles across Python, C++, Java...\n")
+    print("\n[4/4] Running sample profiles across Python, C++, Java...\n")
 
     samples = {
         'python': """

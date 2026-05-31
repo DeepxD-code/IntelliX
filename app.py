@@ -1,23 +1,40 @@
 """IntelliProfile — Flask Web Frontend + REST API"""
 
-import os
-import sys
-import json
-import time
+import hashlib
 import logging
+import os
+import sqlite3
+import sys
+import time
 from datetime import datetime
-from pathlib import Path
 
-from flask import Flask, render_template, request, jsonify
+from flasgger import Swagger, swag_from
+from flask import Flask, g, jsonify, render_template, request
+from flask_cors import CORS
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from profiler_main import (
-    generate_dataset, MLPipeline, CodeProfiler, ConfigManager, setup_logging,
-    COMPLEXITY_LABELS, FEATURE_COLUMNS,
+    COMPLEXITY_LABELS,
+    FEATURE_COLUMNS,
+    CodeProfiler,
+    ConfigManager,
+    MLPipeline,
+    generate_dataset,
+    setup_logging,
 )
 
 app = Flask(__name__)
+CORS(app)
+
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024
+app.config['SWAGGER'] = {
+    'title': 'IntelliProfile API',
+    'description': 'ML-powered code profiler for Python, C++, and Java',
+    'version': '1.0.0',
+    'uiversion': 3,
+}
+Swagger(app)
+
 app.start_time = time.time()
 
 config = ConfigManager()
@@ -28,6 +45,36 @@ profiler = None
 ml_pipeline = None
 model_info = {}
 
+DB_PATH = os.path.join(os.path.dirname(__file__), 'profile_history.db')
+
+
+def get_db():
+    if 'db' not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.execute("""
+            CREATE TABLE IF NOT EXISTS profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                language TEXT NOT NULL,
+                code_hash TEXT NOT NULL,
+                complexity_label TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                execution_time_ms REAL,
+                memory_usage_kb INTEGER,
+                complexity_score REAL,
+                analysis_time_ms REAL
+            )
+        """)
+        g.db.commit()
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(exception):
+    db = g.pop('db', None)
+    if db is not None:
+        db.close()
+
 
 def init_backend():
     global profiler, ml_pipeline, model_info
@@ -36,7 +83,7 @@ def init_backend():
 
     try:
         ml_pipeline = MLPipeline.load_latest()
-        logger.info(f"Loaded existing model")
+        logger.info("Loaded existing model")
         model_info = {
             'accuracy': ml_pipeline.accuracy,
             'f1_score': ml_pipeline.f1,
@@ -73,6 +120,23 @@ def index():
 
 
 @app.route('/api/health', methods=['GET'])
+@swag_from({
+    'tags': ['System'],
+    'responses': {
+        200: {
+            'description': 'Health check',
+            'schema': {
+                'type': 'object',
+                'properties': {
+                    'status': {'type': 'string'},
+                    'model_accuracy': {'type': 'number'},
+                    'uptime_seconds': {'type': 'number'},
+                    'languages': {'type': 'array', 'items': {'type': 'string'}},
+                }
+            }
+        }
+    }
+})
 def api_health():
     return jsonify({
         'status': 'healthy',
@@ -84,6 +148,28 @@ def api_health():
 
 
 @app.route('/api/profile', methods=['POST'])
+@swag_from({
+    'tags': ['Profiling'],
+    'parameters': [
+        {
+            'name': 'body',
+            'in': 'body',
+            'required': True,
+            'schema': {
+                'type': 'object',
+                'required': ['code'],
+                'properties': {
+                    'code': {'type': 'string', 'description': 'Source code to profile'},
+                    'language': {'type': 'string', 'enum': ['python', 'cpp', 'java'], 'default': 'python'},
+                }
+            }
+        }
+    ],
+    'responses': {
+        200: {'description': 'Profile result with metrics, ML prediction, and recommendations'},
+        400: {'description': 'Invalid input'},
+    }
+})
 def api_profile():
     data = request.get_json(force=True)
     code = data.get('code', '').strip()
@@ -91,10 +177,8 @@ def api_profile():
 
     if not code:
         return jsonify({'error': 'Code cannot be empty'}), 400
-
     if language not in ['python', 'cpp', 'java']:
         return jsonify({'error': f'Unsupported language: {language}'}), 400
-
     if len(code) > 100000:
         return jsonify({'error': 'Code exceeds 100KB limit'}), 400
 
@@ -109,6 +193,20 @@ def api_profile():
         result['analysis_time_ms'] = elapsed
         result['timestamp'] = datetime.now().isoformat()
 
+        pred = result.get('ml_prediction', {})
+        label = pred.get('label', '')
+        confidence = pred.get('confidence', 0)
+        metrics = result.get('metrics', {})
+        code_hash = hashlib.md5(code.encode()).hexdigest()[:12]
+
+        db = get_db()
+        db.execute(
+            "INSERT INTO profiles (timestamp, language, code_hash, complexity_label, confidence, execution_time_ms, memory_usage_kb, complexity_score, analysis_time_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (result['timestamp'], language, code_hash, label, confidence,
+             metrics.get('execution_time_ms'), metrics.get('memory_usage_kb'),
+             metrics.get('complexity_score'), elapsed))
+        db.commit()
+
         return jsonify(result)
 
     except SyntaxError as e:
@@ -119,6 +217,35 @@ def api_profile():
 
 
 @app.route('/api/batch-profile', methods=['POST'])
+@swag_from({
+    'tags': ['Profiling'],
+    'parameters': [
+        {
+            'name': 'body',
+            'in': 'body',
+            'required': True,
+            'schema': {
+                'type': 'object',
+                'required': ['snippets'],
+                'properties': {
+                    'snippets': {
+                        'type': 'array',
+                        'items': {
+                            'type': 'object',
+                            'properties': {
+                                'code': {'type': 'string'},
+                                'language': {'type': 'string', 'enum': ['python', 'cpp', 'java']},
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    ],
+    'responses': {
+        200: {'description': 'Batch profile results'},
+    }
+})
 def api_batch_profile():
     data = request.get_json(force=True)
     snippets = data.get('snippets', [])
@@ -159,6 +286,23 @@ def api_batch_profile():
 
 
 @app.route('/api/model-info', methods=['GET'])
+@swag_from({
+    'tags': ['System'],
+    'responses': {
+        200: {
+            'description': 'Model metadata',
+            'schema': {
+                'type': 'object',
+                'properties': {
+                    'model_type': {'type': 'string'},
+                    'features': {'type': 'array', 'items': {'type': 'string'}},
+                    'classes': {'type': 'array', 'items': {'type': 'string'}},
+                    'accuracy': {'type': 'number'},
+                }
+            }
+        }
+    }
+})
 def api_model_info():
     return jsonify({
         'model_type': model_info.get('classifier', 'random_forest'),
@@ -172,13 +316,49 @@ def api_model_info():
 
 
 @app.route('/api/history', methods=['GET'])
+@swag_from({
+    'tags': ['History'],
+    'parameters': [
+        {
+            'name': 'limit',
+            'in': 'query',
+            'type': 'integer',
+            'default': 50,
+            'description': 'Number of recent profiles to return',
+        }
+    ],
+    'responses': {
+        200: {
+            'description': 'Profile history from SQLite',
+            'schema': {
+                'type': 'object',
+                'properties': {
+                    'total': {'type': 'integer'},
+                    'results': {'type': 'array'},
+                }
+            }
+        }
+    }
+})
 def api_history():
-    results_file = os.path.join(os.path.dirname(__file__), 'profile_results.json')
-    if os.path.exists(results_file):
-        with open(results_file) as f:
-            data = json.load(f)
-        return jsonify({'total': len(data), 'results': data})
-    return jsonify({'total': 0, 'results': []})
+    limit = request.args.get('limit', 50, type=int)
+    limit = min(max(limit, 1), 500)
+    db = get_db()
+    cursor = db.execute(
+        "SELECT timestamp, language, complexity_label, confidence, execution_time_ms, memory_usage_kb, complexity_score, analysis_time_ms FROM profiles ORDER BY id DESC LIMIT ?",
+        (limit,))
+    rows = cursor.fetchall()
+    columns = ['timestamp', 'language', 'complexity_label', 'confidence',
+               'execution_time_ms', 'memory_usage_kb', 'complexity_score', 'analysis_time_ms']
+    return jsonify({
+        'total': len(rows),
+        'results': [dict(zip(columns, row)) for row in rows],
+    })
+
+
+@app.route('/api/docs')
+def api_docs():
+    return render_template('swagger.html')
 
 
 if __name__ == '__main__':

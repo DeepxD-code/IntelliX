@@ -3,33 +3,30 @@ Comprehensive test suite for IntelliProfile (profiler_main.py)
 Tests every class, method, and function with 500+ random code snippets per language
 """
 
-import sys
-import os
 import json
+import os
 import random
+import sys
 import tempfile
-import inspect
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
 
 # Ensure we import the module under test
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from profiler_main import (
-    PythonASTAnalyzer,
-    COMPLEXITY_LABELS,
-    _generate_python_snippet,
-    _compute_synthetic_metrics,
-    generate_dataset,
-    FEATURE_COLUMNS,
-    MLPipeline, ModelRegistry,
     CLASSIFIERS,
-    generate_recommendations,
+    COMPLEXITY_LABELS,
+    FEATURE_COLUMNS,
     CodeProfiler,
-    ConfigManager, ConfigError,
-    print_report,
+    ConfigError,
+    ConfigManager,
+    MLPipeline,
+    ModelRegistry,
+    PythonASTAnalyzer,
+    _compute_synthetic_metrics,
+    _generate_python_snippet,
+    generate_dataset,
+    generate_recommendations,
     main,
+    print_report,
 )
 
 # =============================================================================
@@ -280,7 +277,7 @@ class TestResult:
 def test_ast_analyzer(t: TestResult):
     print("  [PythonASTAnalyzer] Testing all 10 visitor methods + edge cases...")
 
-    analyzer = PythonASTAnalyzer()
+    PythonASTAnalyzer()
 
     # Test all visit methods
     cases = [
@@ -437,10 +434,10 @@ def test_ml_pipeline(t: TestResult):
             ml2 = MLPipeline()
             df2 = generate_dataset(60)
             ml2.train(df2)
-            v = ml2.save("test_1.0")
-            saved_model = os.path.join(tmpdir, f"model_vtest_1.0.joblib")
-            saved_scaler = os.path.join(tmpdir, f"model_vtest_1.0_scaler.joblib")
-            saved_meta = os.path.join(tmpdir, f"model_vtest_1.0_meta.json")
+            ml2.save("test_1.0")
+            saved_model = os.path.join(tmpdir, "model_vtest_1.0.joblib")
+            saved_scaler = os.path.join(tmpdir, "model_vtest_1.0_scaler.joblib")
+            saved_meta = os.path.join(tmpdir, "model_vtest_1.0_meta.json")
             if os.path.exists(saved_model) and os.path.exists(saved_scaler) and os.path.exists(saved_meta):
                 t.add("ML save()", "PASS")
             else:
@@ -768,7 +765,7 @@ def test_code_profiler(t: TestResult):
     ]
     with tempfile.TemporaryDirectory() as tmpdir:
         out = os.path.join(tmpdir, "test_out.json")
-        path = profiler.export_json(test_results, out)
+        profiler.export_json(test_results, out)
         if os.path.exists(out):
             with open(out) as f:
                 data = json.load(f)

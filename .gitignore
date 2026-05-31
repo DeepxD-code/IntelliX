@@ -1,39 +1,36 @@
-# IntelliProfile .gitignore
-
-# Personal portfolio page (not project-related)
+# Personal / stale files
 portfolio.html
-
-# Design/prompt doc (not source code)
 Intellix_Production_Implementation_Prompt.md
-
-# Generated profile results
 profile_results.json
-
-# PDFs (generated/static assets not under version control)
-*.pdf
-
-# Python cache
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Stale legacy files (pre-existing, unrelated to current project)
+setup_guide final.pdf
+updated_readme.pdf
+cpp_profiler.cpp.txt
+java_profiler.java
 app.js
 index.html
 styles.css
 
-# Trained ML models (regenerated on each run)
-models/
-*.joblib
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
 
-# Virtual environment
-venv/
-.env/
-.venv/
+# ML models
+models/
+
+# Logs
+logs/
+*.log
+
+# Database
+*.db
 
 # IDE
-.idea/
 .vscode/
+.idea/
 *.swp
 *.swo
 
