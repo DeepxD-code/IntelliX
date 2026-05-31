@@ -12,16 +12,17 @@ from flask import Flask, render_template, request, jsonify
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from profiler_main import (
-    generate_dataset, MLPipeline, CodeProfiler,
+    generate_dataset, MLPipeline, CodeProfiler, ConfigManager, setup_logging,
     COMPLEXITY_LABELS, FEATURE_COLUMNS,
 )
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024
 app.start_time = time.time()
+
+config = ConfigManager()
+setup_logging(config)
+logger = logging.getLogger(__name__)
 
 profiler = None
 ml_pipeline = None
@@ -30,32 +31,35 @@ model_info = {}
 
 def init_backend():
     global profiler, ml_pipeline, model_info
-
     models_dir = os.path.join(os.path.dirname(__file__), 'models')
     os.makedirs(models_dir, exist_ok=True)
 
     try:
         ml_pipeline = MLPipeline.load_latest()
-        logger.info(f"Loaded existing model v{ml_pipeline.save()}")
+        logger.info(f"Loaded existing model")
         model_info = {
             'accuracy': ml_pipeline.accuracy,
             'f1_score': ml_pipeline.f1,
+            'classifier': ml_pipeline.classifier_type,
         }
     except (FileNotFoundError, Exception) as e:
         logger.info(f"No saved model found ({e}). Training new model...")
-        df = generate_dataset(200)
-        ml_pipeline = MLPipeline()
-        results = ml_pipeline.train(df)
+        n = config.get('dataset.n_samples', 500)
+        ctype = config.get('ml_model.classifier_type', 'random_forest')
+        df = generate_dataset(n, seed=config.get('dataset.seed', 42))
+        ml_pipeline = MLPipeline(classifier_type=ctype)
+        results = ml_pipeline.train(df, tune=config.get('ml_model.hyperparameter_tuning', True))
         version = ml_pipeline.save()
         model_info = {
             'accuracy': results['test_accuracy'],
             'f1_score': results['test_f1_weighted'],
             'cv_accuracy': results['cv_accuracy_mean'],
+            'classifier': ctype,
             'version': version,
         }
-        logger.info(f"Trained new model v{version}, accuracy={results['test_accuracy']:.4f}")
+        logger.info(f"Trained {ctype}, acc={results['test_accuracy']:.4f}")
 
-    profiler = CodeProfiler(ml_pipeline)
+    profiler = CodeProfiler(ml_pipeline, config)
 
 
 init_backend()
@@ -157,11 +161,12 @@ def api_batch_profile():
 @app.route('/api/model-info', methods=['GET'])
 def api_model_info():
     return jsonify({
-        'model_type': 'RandomForest',
-        'n_estimators': 200,
-        'max_depth': 12,
+        'model_type': model_info.get('classifier', 'random_forest'),
         'features': FEATURE_COLUMNS,
         'classes': COMPLEXITY_LABELS,
+        'config_classifier': config.get('ml_model.classifier_type', 'random_forest'),
+        'config_tuning': config.get('ml_model.hyperparameter_tuning', True),
+        'config_cv_folds': config.get('ml_model.cross_validation_folds', 5),
         **model_info,
     })
 

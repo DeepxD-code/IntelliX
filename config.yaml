@@ -1,0 +1,70 @@
+# IntelliProfile Production Configuration
+# Environment overrides: use CONFIG_PATH env var or defaults to ./config.yaml
+
+profiling:
+  execution_timeout_seconds: 30
+  memory_limit_mb: 512
+  max_code_length_chars: 100000
+  supported_languages: ["python", "cpp", "java"]
+
+analysis:
+  python:
+    ast_enabled: true
+    track_list_comprehensions: true
+    track_lambda: true
+    track_try_except: true
+  cpp:
+    method: "heuristic"  # heuristic | regex | clang_ast (future)
+    track_arrays: true
+    track_vectors: true
+  java:
+    method: "heuristic"  # heuristic | asm_bytecode (future)
+    track_cyclomatic: true
+    track_method_calls: true
+
+ml_model:
+  classifier_type: "random_forest"  # random_forest | gradient_boosting | svm | neural_network
+  auto_select_best: true
+  cross_validation_folds: 5
+  test_split: 0.2
+  random_state: 42
+  hyperparameter_tuning: true
+  retrain_on_startup: false
+  confidence_threshold: 0.75
+
+dataset:
+  n_samples: 500
+  seed: 42
+  balance_classes: true
+  synthetic_noise: 0.15
+
+thresholds:
+  execution_time_ms: 100.0
+  memory_usage_kb: 5000
+  loop_depth: 3
+  max_nesting_depth: 4
+  function_calls: 10
+  complexity_score:
+    efficient_max: 5.0
+    moderate_max: 15.0
+
+logging:
+  level: "INFO"
+  format: "json"  # json | text
+  output: "both"  # file | console | both
+  file_path: "logs/intellix.log"
+  max_file_size_mb: 10
+  backup_count: 3
+
+monitoring:
+  enabled: false
+  metrics_port: 9090
+  track_request_duration: true
+  track_prediction_distribution: true
+
+server:
+  host: "0.0.0.0"
+  port: 5000
+  debug: false
+  max_requests_per_minute: 100
+  max_batch_size: 50

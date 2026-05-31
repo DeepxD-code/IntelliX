@@ -23,10 +23,11 @@ from profiler_main import (
     _compute_synthetic_metrics,
     generate_dataset,
     FEATURE_COLUMNS,
-    MLPipeline,
-    RECOMMENDATIONS,
+    MLPipeline, ModelRegistry,
+    CLASSIFIERS,
     generate_recommendations,
     CodeProfiler,
+    ConfigManager, ConfigError,
     print_report,
     main,
 )
@@ -438,7 +439,7 @@ def test_ml_pipeline(t: TestResult):
             ml2.train(df2)
             v = ml2.save("test_1.0")
             saved_model = os.path.join(tmpdir, f"model_vtest_1.0.joblib")
-            saved_scaler = os.path.join(tmpdir, f"scaler_vtest_1.0.joblib")
+            saved_scaler = os.path.join(tmpdir, f"model_vtest_1.0_scaler.joblib")
             saved_meta = os.path.join(tmpdir, f"model_vtest_1.0_meta.json")
             if os.path.exists(saved_model) and os.path.exists(saved_scaler) and os.path.exists(saved_meta):
                 t.add("ML save()", "PASS")
@@ -496,6 +497,124 @@ def test_ml_pipeline(t: TestResult):
             t.add("ML load_latest empty", "FAIL", f"Wrong exception: {e}")
         finally:
             MLPipeline.MODEL_DIR = original_model_dir
+
+
+def test_config_manager(t: TestResult):
+    print("  [ConfigManager] Load, validate, get, edge cases...")
+
+    # Test loading from default path
+    cfg = ConfigManager()
+    try:
+        cfg.validate()
+        t.add("Config validate", "PASS")
+    except ConfigError as e:
+        t.add("Config validate", "FAIL", str(e))
+    except Exception as e:
+        t.add("Config validate", "FAIL", f"Unexpected: {e}")
+
+    # Test dot-notation access
+    val = cfg.get('profiling.execution_timeout_seconds')
+    if isinstance(val, int) and val >= 1:
+        t.add("Config get dot-notation", "PASS")
+    else:
+        t.add("Config get dot-notation", "FAIL", f"Got {val}")
+
+    # Test default fallback
+    val = cfg.get('nonexistent.key', 'fallback')
+    if val == 'fallback':
+        t.add("Config get default", "PASS")
+    else:
+        t.add("Config get default", "FAIL", f"Got {val}")
+
+    # Test nested access
+    val = cfg.get('thresholds.complexity_score.efficient_max')
+    if isinstance(val, (int, float)):
+        t.add("Config nested key", "PASS")
+    else:
+        t.add("Config nested key", "FAIL", f"Got {val}")
+
+    # Test missing file
+    cfg2 = ConfigManager(config_path='/nonexistent/config.yaml')
+    if cfg2.config == {}:
+        t.add("Config missing file", "PASS")
+    else:
+        t.add("Config missing file", "FAIL", "Should return empty dict")
+
+    # Test all required keys exist
+    required = ['profiling', 'analysis', 'ml_model', 'dataset', 'thresholds', 'logging', 'server']
+    present = [k for k in required if k in cfg.config]
+    if len(present) == len(required):
+        t.add("Config has all sections", "PASS")
+    else:
+        t.add("Config has all sections", "FAIL", f"Missing: {set(required) - set(present)}")
+
+
+def test_multiple_classifiers(t: TestResult):
+    print("  [Multiple Classifiers] RF, GB, SVM, MLP training...")
+
+    df = generate_dataset(300, seed=42)
+
+    for ctype in CLASSIFIERS:
+        try:
+            ml = MLPipeline(classifier_type=ctype)
+            results = ml.train(df.copy(), tune=False, cv_folds=3)
+            if results['test_accuracy'] >= 0.5:
+                t.add(f"Classifier {ctype}", "PASS")
+            else:
+                t.add(f"Classifier {ctype}", "FAIL", f"Low acc: {results['test_accuracy']:.4f}")
+        except Exception as e:
+            t.add(f"Classifier {ctype}", "FAIL", str(e))
+
+    # Test GridSearch tuning on RF
+    try:
+        ml = MLPipeline(classifier_type='random_forest')
+        results = ml.train(df.copy(), tune=True, cv_folds=3)
+        if 'best_params' in results and results['best_params']:
+            t.add("Hyperparameter tuning", "PASS")
+        else:
+            t.add("Hyperparameter tuning", "FAIL", "No best_params in results")
+    except Exception as e:
+        t.add("Hyperparameter tuning", "FAIL", str(e))
+
+
+def test_model_registry(t: TestResult):
+    print("  [ModelRegistry] List versions, get latest...")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Save a model to the temp dir
+        original_dir = MLPipeline.MODEL_DIR
+        MLPipeline.MODEL_DIR = tmpdir
+        try:
+            df = generate_dataset(150)
+            ml = MLPipeline()
+            ml.train(df)
+            ml.save("v1.0.0")
+            ml.save("v2.0.0")
+
+            registry = ModelRegistry(registry_dir=tmpdir)
+            versions = registry.list_versions()
+            if len(versions) >= 2:
+                t.add("Registry list versions", "PASS")
+            else:
+                t.add("Registry list versions", "FAIL", f"Only {len(versions)}")
+
+            latest = registry.get_latest_version()
+            if latest and '2.0.0' in str(latest):
+                t.add("Registry get latest", "PASS")
+            else:
+                t.add("Registry get latest", "FAIL", f"Got {latest}")
+
+        finally:
+            MLPipeline.MODEL_DIR = original_dir
+
+    # Empty registry
+    with tempfile.TemporaryDirectory() as tmpdir:
+        registry = ModelRegistry(registry_dir=tmpdir)
+        versions = registry.list_versions()
+        if versions == []:
+            t.add("Registry empty", "PASS")
+        else:
+            t.add("Registry empty", "FAIL")
 
 
 def test_recommendations(t: TestResult):
@@ -810,6 +929,12 @@ def run_all_tests():
     test_dataset_generator(t)
     print()
     test_ml_pipeline(t)
+    print()
+    test_config_manager(t)
+    print()
+    test_multiple_classifiers(t)
+    print()
+    test_model_registry(t)
     print()
     test_recommendations(t)
     print()
