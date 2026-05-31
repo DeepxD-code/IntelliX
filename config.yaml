@@ -33,10 +33,10 @@ ml_model:
   confidence_threshold: 0.75
 
 dataset:
-  n_samples: 500
+  n_samples: 3000
   seed: 42
   balance_classes: true
-  synthetic_noise: 0.15
+  synthetic_noise: 0.05
 
 thresholds:
   execution_time_ms: 100.0

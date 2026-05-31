@@ -1,5 +1,5 @@
 # Personal / stale files
-portfolio.html
+/portfolio.html
 Intellix_Production_Implementation_Prompt.md
 profile_results.json
 setup_guide final.pdf
@@ -7,7 +7,6 @@ updated_readme.pdf
 cpp_profiler.cpp.txt
 java_profiler.java
 app.js
-index.html
 styles.css
 
 # Python

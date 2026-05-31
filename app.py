@@ -114,9 +114,13 @@ init_backend()
 
 @app.route('/')
 def index():
-    return render_template('index.html',
-                           languages=['python', 'cpp', 'java'],
-                           model_info=model_info)
+    return render_template('portfolio.html', model_info={
+        'accuracy': model_info.get('accuracy', 0),
+        'f1_score': model_info.get('f1_score', 0),
+        'classifier': model_info.get('classifier', 'random_forest'),
+        'features': FEATURE_COLUMNS,
+        'classes': COMPLEXITY_LABELS,
+    })
 
 
 @app.route('/api/health', methods=['GET'])

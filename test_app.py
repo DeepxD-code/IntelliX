@@ -156,9 +156,9 @@ def test_index_page(t):
     with app.test_client() as c:
         resp = c.get('/')
         if resp.status_code == 200:
-            t.add("GET / serves index.html", "PASS")
+            t.add("GET / serves portfolio.html", "PASS")
         else:
-            t.add("GET / serves index.html", "FAIL", f"status={resp.status_code}")
+            t.add("GET / serves portfolio.html", "FAIL", f"status={resp.status_code}")
 
 
 def run_api_tests():
