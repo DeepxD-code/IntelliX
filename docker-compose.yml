@@ -6,7 +6,13 @@ services:
     ports:
       - "5000:5000"
     volumes:
-      - ./models:/app/models
+      # NOTE: models/ is intentionally NOT mounted here. The Dockerfile now
+      # trains and bakes a model into the image at build time (see Dockerfile
+      # comments). Mounting an empty host ./models directory over it would
+      # shadow the baked-in model and bring back the slow-cold-start problem
+      # this was meant to fix. If you want to persist/inspect trained models
+      # on the host, copy them out explicitly (`docker cp`) rather than
+      # mounting over this path.
       - ./logs:/app/logs
       - ./config.yaml:/app/config.yaml
     environment:

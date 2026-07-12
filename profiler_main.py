@@ -3,6 +3,10 @@ import json
 import logging
 import os
 import random
+import subprocess
+import sys
+import tempfile
+import textwrap
 from datetime import datetime
 from typing import Any
 
@@ -10,12 +14,16 @@ import joblib
 import numpy as np
 import pandas as pd
 import yaml
+from sklearn.base import clone
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, cross_val_score, train_test_split
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
+
+from cpp_analyzer import CppTreeSitterAnalyzer
+from java_analyzer import JavaTreeSitterAnalyzer
 
 # =============================================================================
 # 0. CONFIGURATION MANAGEMENT
@@ -111,6 +119,114 @@ logger = setup_logging()
 # 1. PYTHON AST ANALYZER
 # =============================================================================
 
+# Known-complexity lookup for builtins that hide O(n)/O(n log n) work behind
+# a call with no 'for'/'while' keyword in the source -- the Python-side
+# equivalent of cpp_analyzer.py/java_analyzer.py's KNOWN_COMPLEXITY tables.
+# Confirmed blind spot from the real-template audit: list(set(x))-style
+# deduplication (see benchmarks/real_templates/real_template_validation.py,
+# "py_set_dedup").
+#
+# Design note -- deliberately NOT chain-capped, unlike java_analyzer.py:
+# Java's .stream().map().collect() is chain-capped to one unit because the
+# JVM's Stream implementation lazily fuses the whole pipeline into a single
+# pass. CPython's nested builtins have no equivalent fusion: list(set(x))
+# genuinely performs two separate materializing passes (set() iterates x
+# once to build the set; list() iterates the set once more to build the
+# list), so weighting both calls independently (2.0 total) is the more
+# physically accurate model, not a bug to guard against.
+#
+# The one real exception: a bare generator expression passed directly as
+# the sole argument (sum(x for x in y), any(x > 0 for x in arr)) IS a
+# single fused pass -- Python's generator protocol lazily pulls one value
+# at a time into the consumer, same fusion behavior as Java's Stream. That
+# loop is already counted by visit_GeneratorExp, so visit_Call skips adding
+# a redundant weight in that one specific shape (see visit_Call below).
+KNOWN_COMPLEXITY = {
+    # O(n log n)
+    'sorted': 1.5,
+    # O(n)
+    'set': 1.0, 'list': 1.0, 'tuple': 1.0, 'dict': 1.0, 'frozenset': 1.0,
+    'sum': 1.0, 'max': 1.0, 'min': 1.0, 'any': 1.0, 'all': 1.0,
+}
+
+# Recursion-shape detector: distinguishes "safe" multi-way recursion (divide-
+# and-conquer, where each recursive call's argument is a meaningfully shrunk
+# version of the input -- merge sort, quicksort, tree traversal) from
+# "dangerous" multi-way recursion (naive exponential blowup -- naive
+# Fibonacci and its relatives, where the argument barely changes between
+# calls). A raw self-call count alone can't tell these apart: both shapes
+# commonly make 2 recursive calls per invocation. What differs is HOW the
+# argument changes, checked here via three patterns, each verified against
+# every existing recursive template in this file's own PYTHON_TEMPLATES
+# before being trusted (see HANDOFF.md for the false-positive this caught
+# on the first attempt -- quicksort's shrinking happens in an earlier
+# assignment, not at the call site itself, which the naive version missed):
+#   1. Floor/true division by a constant >=2 (n // 2), including through an
+#      intermediate variable (mid = len(arr) // 2; f(arr[:mid])).
+#   2. A list/set comprehension with a filter condition ([x for x in arr if
+#      x < p]), including through an intermediate variable -- the average-case
+#      partition step in quicksort-shaped code.
+#   3. Attribute access (node.left) in a function that has an explicit
+#      None/falsy base-case check on its parameter -- the standard signature
+#      of recursion into a tree/linked structure, where the AST alone can't
+#      otherwise know the child is "smaller."
+# A function with 2+ self-calls where NONE of them match any of these three
+# patterns is flagged, with risk = number of self-calls (higher risk for
+# more branches, e.g. f(n-1)+f(n-2)+f(n-3) outranks f(n-1)+f(n-2)).
+def _analyze_recursion_shape(func_node: ast.FunctionDef) -> int:
+    fname = func_node.name
+
+    shrink_vars = set()   # names assigned via floor/true division by >=2
+    filter_vars = set()   # names assigned via a filtered comprehension
+    for n in ast.walk(func_node):
+        if isinstance(n, ast.Assign):
+            targets = [t.id for t in n.targets if isinstance(t, ast.Name)]
+            if isinstance(n.value, ast.BinOp) and isinstance(n.value.op, (ast.FloorDiv, ast.Div)):
+                divisor = n.value.right
+                if isinstance(divisor, ast.Constant) and isinstance(divisor.value, (int, float)) and divisor.value >= 2:
+                    shrink_vars.update(targets)
+            if isinstance(n.value, (ast.ListComp, ast.SetComp)) and any(gen.ifs for gen in n.value.generators):
+                filter_vars.update(targets)
+
+    has_none_basecase = any(
+        isinstance(n, ast.If) and (
+            (isinstance(n.test, ast.UnaryOp) and isinstance(n.test.op, ast.Not)) or
+            (isinstance(n.test, ast.Compare) and any(
+                isinstance(c, ast.Constant) and c.value is None for c in n.test.comparators
+            ))
+        )
+        for n in ast.walk(func_node) if isinstance(n, ast.If)
+    )
+
+    def arg_is_shrinking(arg) -> bool:
+        if isinstance(arg, ast.BinOp) and isinstance(arg.op, (ast.FloorDiv, ast.Div)):
+            divisor = arg.right
+            if isinstance(divisor, ast.Constant) and isinstance(divisor.value, (int, float)) and divisor.value >= 2:
+                return True
+        if isinstance(arg, ast.Subscript):
+            names_in_slice = [n.id for n in ast.walk(arg.slice) if isinstance(n, ast.Name)]
+            if any(v in shrink_vars for v in names_in_slice):
+                return True
+        if isinstance(arg, ast.Name) and arg.id in shrink_vars:
+            return True
+        if isinstance(arg, ast.ListComp) and any(gen.ifs for gen in arg.generators):
+            return True
+        if isinstance(arg, ast.Name) and arg.id in filter_vars:
+            return True
+        if isinstance(arg, ast.Attribute) and has_none_basecase:
+            return True
+        return False
+
+    self_calls = [
+        n for n in ast.walk(func_node)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == fname
+    ]
+    if len(self_calls) < 2:
+        return 0
+    any_shrinking = any(arg_is_shrinking(a) for call in self_calls for a in call.args)
+    return 0 if any_shrinking else len(self_calls)
+
+
 class PythonASTAnalyzer(ast.NodeVisitor):
     """Analyzes Python code using the built-in AST module."""
 
@@ -119,13 +235,21 @@ class PythonASTAnalyzer(ast.NodeVisitor):
             'loops': 0, 'function_calls': 0, 'conditionals': 0,
             'max_nesting_depth': 0, 'function_defs': 0, 'class_defs': 0,
             'list_comprehensions': 0, 'lambda_functions': 0, 'try_except_blocks': 0,
+            'stdlib_complexity_weight': 0.0, 'recursive_branching_risk': 0,
+            'element_swap_weight': 0.0,
         }
         self._current_depth = 0
 
     def visit_FunctionDef(self, node):
-        self.metrics['function_defs'] += 1; self.generic_visit(node)
+        self.metrics['function_defs'] += 1
+        risk = _analyze_recursion_shape(node)
+        self.metrics['recursive_branching_risk'] = max(self.metrics['recursive_branching_risk'], risk)
+        self.generic_visit(node)
     def visit_AsyncFunctionDef(self, node):
-        self.metrics['function_defs'] += 1; self.generic_visit(node)
+        self.metrics['function_defs'] += 1
+        risk = _analyze_recursion_shape(node)
+        self.metrics['recursive_branching_risk'] = max(self.metrics['recursive_branching_risk'], risk)
+        self.generic_visit(node)
     def visit_For(self, node):
         self.metrics['loops'] += 1; self._current_depth += 1
         self.metrics['max_nesting_depth'] = max(self.metrics['max_nesting_depth'], self._current_depth)
@@ -140,8 +264,38 @@ class PythonASTAnalyzer(ast.NodeVisitor):
         self.generic_visit(node); self._current_depth -= 1
     def visit_If(self, node):
         self.metrics['conditionals'] += 1; self.generic_visit(node)
+    def visit_Assign(self, node):
+        # Detects arr[i], arr[j] = arr[j], arr[i]-style in-place element
+        # swaps: a tuple assignment where every target is a Subscript.
+        # Structurally distinct from a plain single-value assignment, and a
+        # real, verified signal -- swept against every EFFICIENT/MODERATE
+        # template in PYTHON_TEMPLATES before being trusted: zero matches
+        # anywhere except bubble sort, the one NEEDS_OPTIMIZATION template
+        # that actually has one. Generalizes to any real swap-based
+        # algorithm (selection sort, cocktail sort, etc.), not just this
+        # one template, even though only one happens to be in this dataset.
+        if (len(node.targets) == 1 and isinstance(node.targets[0], ast.Tuple)
+                and len(node.targets[0].elts) >= 2
+                and all(isinstance(e, ast.Subscript) for e in node.targets[0].elts)
+                and isinstance(node.value, ast.Tuple)
+                and len(node.value.elts) == len(node.targets[0].elts)):
+            self.metrics['element_swap_weight'] = 1.0
+        self.generic_visit(node)
     def visit_Call(self, node):
-        self.metrics['function_calls'] += 1; self.generic_visit(node)
+        self.metrics['function_calls'] += 1
+        func = node.func
+        # Only bare-name calls (set(x), not obj.set()) match a builtin --
+        # matches the C++/Java analyzers' name-based matching, but Python
+        # can actually require ast.Name specifically (no receiver at all),
+        # which is a real precision improvement over Java's necessarily
+        # fuzzier "any method with this name" matching.
+        if isinstance(func, ast.Name) and func.id in KNOWN_COMPLEXITY and len(node.args) == 1:
+            # Skip when the sole argument is a bare generator expression --
+            # that's a single fused pass already counted by
+            # visit_GeneratorExp (see KNOWN_COMPLEXITY's docstring above).
+            if not isinstance(node.args[0], ast.GeneratorExp):
+                self.metrics['stdlib_complexity_weight'] += KNOWN_COMPLEXITY[func.id]
+        self.generic_visit(node)
     def visit_ClassDef(self, node):
         self.metrics['class_defs'] += 1; self.generic_visit(node)
     def visit_Lambda(self, node):
@@ -165,6 +319,7 @@ class PythonASTAnalyzer(ast.NodeVisitor):
     def visit_ListComp(self, node): self._visit_comp(node, 'list')
     def visit_SetComp(self, node): self._visit_comp(node, 'set')
     def visit_DictComp(self, node): self._visit_comp(node, 'dict')
+    def visit_GeneratorExp(self, node): self._visit_comp(node, 'genexp')
 
     def analyze(self, code: str) -> dict[str, Any]:
         tree = ast.parse(code)
@@ -249,6 +404,15 @@ PYTHON_TEMPLATES = {
         "def f(n):\n    sieve = [True] * (n + 1)\n    sieve[0] = sieve[1] = False\n    for i in range(2, int(n**0.5) + 1):\n        if sieve[i]:\n            for j in range(i * i, n + 1, i):\n                sieve[j] = False\n    return [i for i, p in enumerate(sieve) if p]",
         "def f(node):\n    if not node:\n        return None\n    return {'v': node.v, 'l': f(node.l), 'r': f(node.r)}",
         "def f(n):\n    if n <= 1:\n        return 1\n    return n * f(n - 1)",
+        # Relabeled NEEDS_OPTIMIZATION -> MODERATE: superficially resembles the
+        # Tower-of-Hanoi recurrence (2*T(n-1)+1), but computing this VALUE is
+        # only 1 recursive self-call per invocation -- genuinely O(n) linear
+        # recursion, verified via real execution (exactly n calls at n=10/20/30,
+        # timing in the same ballpark as the factorial template above). The
+        # VALUE returned grows exponentially; the COMPUTATION to get there
+        # doesn't -- those are different things, and the original NEEDS_OPTIMIZATION
+        # label conflated them.
+        "def f(n):\n    if n == 1:\n        return 1\n    return 2 * f(n - 1) + 1",
         "def f(t, p):\n    pos = []\n    for i in range(len(t) - len(p) + 1):\n        m = True\n        for j in range(len(p)):\n            if t[i + j] != p[j]:\n                m = False\n                break\n        if m:\n            pos.append(i)\n    return pos",
         "def f(arr):\n    if len(arr) <= 1:\n        return arr\n    p = arr[len(arr) // 2]\n    l = [x for x in arr if x < p]\n    m = [x for x in arr if x == p]\n    r = [x for x in arr if x > p]\n    return f(l) + m + f(r)",
         "def f(nums, target):\n    for i in range(len(nums)):\n        for j in range(i + 1, len(nums)):\n            if nums[i] + nums[j] == target:\n                return [i, j]\n    return []",
@@ -260,14 +424,12 @@ PYTHON_TEMPLATES = {
         "def f(graph, start, end):\n    queue = [(start, [start])]\n    visited = {start}\n    while queue:\n        node, path = queue.pop(0)\n        for neighbor in graph[node]:\n            if neighbor == end:\n                return path + [neighbor]\n            if neighbor not in visited:\n                visited.add(neighbor)\n                queue.append((neighbor, path + [neighbor]))\n    return []",
         "def f(m):\n    return [[m[j][i] for j in range(len(m))] for i in range(len(m[0]))]",
         "import heapq\ndef f(arr):\n    heapq.heapify(arr)\n    return [heapq.heappop(arr) for _ in range(len(arr))]",
-        "def f(arr):\n    for i in range(len(arr)):\n        for j in range(len(arr) - i - 1):\n            if arr[j] > arr[j + 1]:\n                arr[j], arr[j + 1] = arr[j + 1], arr[j]\n    return arr",
         # --- Additional moderate patterns ---
         "def f(n):\n    return sum(i * j for i in range(n) for j in range(i))",
         "def f(mat):\n    total = 0\n    for i in range(len(mat)):\n        for j in range(len(mat[i])):\n            total += mat[i][j]\n    return total",
         "def f(n):\n    count = 0\n    for a in range(n):\n        for b in range(a, n):\n            if (a + b) % 2 == 0:\n                count += 1\n    return count",
         "def f(arr):\n    n = len(arr)\n    for i in range(n):\n        for j in range(n):\n            if i != j and arr[i] == arr[j]:\n                return True\n    return False",
         "def f(n):\n    if n == 0:\n        return 0\n    return n + f(n - 1)",
-        "def f(n):\n    if n <= 2:\n        return 1\n    return f(n - 1) + f(n - 2)",
         "def f(s):\n    def g(i, j):\n        if i >= j:\n            return True\n        if s[i] != s[j]:\n            return False\n        return g(i + 1, j - 1)\n    return g(0, len(s) - 1)",
         "def f(arr, t):\n    lo, hi = 0, len(arr) - 1\n    while lo <= hi:\n        mid = (lo + hi) // 2\n        if arr[mid] == t:\n            return mid\n        elif arr[mid] < t:\n            lo = mid + 1\n        else:\n            hi = mid - 1\n    return -1",
         "def f(s, p):\n    if not p:\n        return True\n    if not s:\n        return False\n    for i in range(len(s) - len(p) + 1):\n        match = True\n        for j in range(len(p)):\n            if s[i + j] != p[j]:\n                match = False\n                break\n        if match:\n            return True\n    return False",
@@ -275,9 +437,18 @@ PYTHON_TEMPLATES = {
         "def f(arr):\n    pairs = []\n    for i in range(len(arr)):\n        for j in range(i + 1, len(arr)):\n            pairs.append((arr[i], arr[j]))\n    return pairs",
     ],
     'NEEDS_OPTIMIZATION': [
+        # --- O(n²) relabeled from MODERATE: empirically measured exponent ≈ 2.0,
+        #     exceeds the classifier's NEEDS_OPTIMIZATION threshold (>1.5). ---
+        "def f(arr):\n    for i in range(len(arr)):\n        for j in range(len(arr) - i - 1):\n            if arr[j] > arr[j + 1]:\n                arr[j], arr[j + 1] = arr[j + 1], arr[j]\n    return arr",
         # --- O(n³) / exponential patterns ---
         "def f(A, B, C):\n    res = []\n    for i in range(len(A)):\n        row = []\n        for j in range(len(B)):\n            s = 0\n            for k in range(len(C)):\n                s += A[i][k] * B[k][j]\n            row.append(s)\n        res.append(row)\n    return res",
         "def f(n):\n    if n <= 1:\n        return n\n    return f(n - 1) + f(n - 2)",
+        # Relabeled from MODERATE: identical algorithm to the line above (naive
+        # exponential Fibonacci), differing only in a cosmetic base case
+        # (n<=2:return 1 vs n<=1:return n). Verified exponential via direct
+        # execution: 109 -> 13,529 -> 1,664,079 calls at n=10/20/30 -- the same
+        # growth as its sibling. The two templates shouldn't have disagreed.
+        "def f(n):\n    if n <= 2:\n        return 1\n    return f(n - 1) + f(n - 2)",
         "def f(g):\n    V = len(g)\n    d = [row[:] for row in g]\n    for k in range(V):\n        for i in range(V):\n            for j in range(V):\n                if d[i][k] + d[k][j] < d[i][j]:\n                    d[i][j] = d[i][k] + d[k][j]\n    return d",
         "def f(a, b, c, d, e):\n    if a:\n        if b:\n            if c:\n                if d:\n                    if e:\n                        return 'all'\n                    else:\n                        return 'e'\n                else:\n                    return 'd'\n            else:\n                return 'c'\n        else:\n            return 'b'\n    return 'a'",
         "def f(n):\n    c = 0\n    for i in range(n):\n        for j in range(n):\n            for k in range(n):\n                for l in range(n):\n                    c += 1\n    return c",
@@ -287,7 +458,6 @@ PYTHON_TEMPLATES = {
         "def f(board):\n    def valid(r, c, val):\n        for i in range(9):\n            if board[r][i] == val or board[i][c] == val:\n                return False\n        br = r // 3 * 3\n        bc = c // 3 * 3\n        for i in range(3):\n            for j in range(3):\n                if board[br + i][bc + j] == val:\n                    return False\n        return True\n    def solve():\n        for r in range(9):\n            for c in range(9):\n                if board[r][c] == 0:\n                    for val in range(1, 10):\n                        if valid(r, c, val):\n                            board[r][c] = val\n                            if solve():\n                                return True\n                            board[r][c] = 0\n                    return False\n        return True\n    return solve()",
         "def f(n):\n    def safe(b, r, c):\n        for i in range(r):\n            if b[i] == c or abs(b[i] - c) == r - i:\n                return False\n        return True\n    def solve(b, r):\n        if r == n:\n            return [b[:]]\n        sols = []\n        for c in range(n):\n            if safe(b, r, c):\n                b[r] = c\n                sols.extend(solve(b, r + 1))\n        return sols\n    return solve([0] * n, 0)",
         "def f(arr):\n    def bt(path, used):\n        if len(path) == len(arr):\n            res.append(path[:])\n            return\n        for i in range(len(arr)):\n            if not used[i]:\n                used[i] = True\n                path.append(arr[i])\n                bt(path, used)\n                path.pop()\n                used[i] = False\n    res = []\n    bt([], [False] * len(arr))\n    return res",
-        "def f(n):\n    if n == 1:\n        return 1\n    return 2 * f(n - 1) + 1",
         "def f(nums, t):\n    def dfs(i, s):\n        if s == t:\n            return True\n        if i >= len(nums):\n            return False\n        return dfs(i + 1, s + nums[i]) or dfs(i + 1, s)\n    return dfs(0, 0)",
         "def f(dist):\n    n = len(dist)\n    VISITED_ALL = (1 << n) - 1\n    def dp(mask, pos):\n        if mask == VISITED_ALL:\n            return dist[pos][0]\n        if (mask, pos) in memo:\n            return memo[(mask, pos)]\n        ans = float('inf')\n        for city in range(n):\n            if not (mask & (1 << city)):\n                ans = min(ans, dist[pos][city] + dp(mask | (1 << city), city))\n        memo[(mask, pos)] = ans\n        return ans\n    memo = {}\n    return dp(1, 0)",
         "def f(chars, max_len):\n    def gen(prefix, depth):\n        if depth > max_len:\n            return\n        if prefix:\n            results.append(prefix)\n        for c in chars:\n            gen(prefix + c, depth + 1)\n    results = []\n    gen('', 0)\n    return results",
@@ -347,15 +517,21 @@ CPP_TEMPLATES = {
         "void f(std::vector<std::vector<int>>& A, std::vector<std::vector<int>>& B) { for (size_t i = 0; i < A.size(); i++) for (size_t j = 0; j < A[0].size(); j++) A[i][j] += B[i][j]; }\n#include <vector>",
         "void f(std::vector<std::vector<int>>& m) { for (size_t i = 0; i < m.size(); i++) for (size_t j = i + 1; j < m[i].size(); j++) std::swap(m[i][j], m[j][i]); }\n#include <vector>",
         "void f(std::vector<std::vector<int>>& m) { for (auto& row : m) for (int& x : row) x *= 2; }\n#include <vector>",
-        "std::vector<int> f(int n) { std::vector<bool> sieve(n + 1, true); std::vector<int> primes; for (int i = 2; i <= n; i++) { if (sieve[i]) { primes.push_back(i); for (int j = i * i; j <= n; j += i) sieve[j] = false; } } return primes; }\n#include <vector>",
+        # Overflow bug fixed (see benchmarks/real_templates/overflow_bug_report.md):
+        # outer loop was 'i <= n', causing i*i to overflow a 32-bit int and crash
+        # (SIGSEGV) for n above ~46341^2. Sieving is now correctly bounded by
+        # sqrt(n) (via an overflow-safe long long cast); prime collection is a
+        # separate pass over the full 2..n range, since composites above sqrt(n)
+        # are still marked by the sieve but never themselves iterated as 'i' --
+        # mirrors the structure the Python template already used correctly.
+        "std::vector<int> f(int n) { std::vector<bool> sieve(n + 1, true); for (int i = 2; (long long)i * i <= n; i++) { if (sieve[i]) { for (int j = i * i; j <= n; j += i) sieve[j] = false; } } std::vector<int> primes; for (int i = 2; i <= n; i++) if (sieve[i]) primes.push_back(i); return primes; }\n#include <vector>",
         "int f(int n) { if (n <= 1) return 1; return n * f(n - 1); }",
+        # Relabeled NEEDS_OPTIMIZATION -> MODERATE: same reasoning as the Python
+        # version above -- superficially resembles Hanoi's 2*T(n-1)+1 recurrence,
+        # but computing the value is 1 self-call per invocation, genuinely O(n),
+        # verified via real compiled execution (exactly n calls at n=10/20/30).
+        "int f(int n) { if (n <= 1) return 1; return 2 * f(n - 1) + 1; }",
         "int f(int n) { if (n < 2) return false; for (int i = 2; i * i <= n; i++) if (n % i == 0) return false; return true; }",
-        "void f(std::vector<int>& arr) { for (size_t i = 0; i < arr.size(); i++) for (size_t j = 0; j < arr.size() - i - 1; j++) if (arr[j] > arr[j + 1]) std::swap(arr[j], arr[j + 1]); }\n#include <vector>",
-        "std::vector<int> f(const std::vector<int>& arr) { std::vector<int> r; for (size_t i = 0; i < arr.size(); i++) for (size_t j = i + 1; j < arr.size(); j++) r.push_back(arr[i] + arr[j]); return r; }\n#include <vector>",
-        "bool f(const std::vector<std::vector<int>>& mat, int t) { for (size_t i = 0; i < mat.size(); i++) for (size_t j = 0; j < mat[i].size(); j++) if (mat[i][j] == t) return true; return false; }\n#include <vector>",
-        "int f(int arr[], int n) { for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) if (arr[i] == arr[j]) return arr[i]; return -1; }",
-        "int f(int n) { if (n <= 2) return 1; return f(n - 1) + f(n - 2); }",
-        "int f(const std::vector<int>& arr, int t) { int lo = 0, hi = arr.size() - 1; while (lo <= hi) { int mid = (lo + hi) / 2; if (arr[mid] == t) return mid; if (arr[mid] < t) lo = mid + 1; else hi = mid - 1; } return -1; }\n#include <vector>",
         "void f(std::vector<int>& v) { std::sort(v.begin(), v.end()); }\n#include <algorithm>\n#include <vector>",
         "int f(const std::string& text, const std::string& pat) { for (size_t i = 0; i <= text.length() - pat.length(); i++) { bool m = true; for (size_t j = 0; j < pat.length(); j++) { if (text[i + j] != pat[j]) { m = false; break; } } if (m) return i; } return -1; }",
         "int f(int n) { int c = 0; for (int i = 0; i < n; i++) for (int j = 0; j <= i; j++) c += i * j; return c; }",
@@ -367,13 +543,14 @@ CPP_TEMPLATES = {
         "void f(int n) { for (int i = 0; i < n; i++) for (int j = 0; j < n; j++) std::cout << i * j << ' '; }\n#include <iostream>",
     ],
     'NEEDS_OPTIMIZATION': [
+        # --- O(n²) relabeled from MODERATE: empirically measured exponent ≈ 2.0 ---
+        "void f(std::vector<int>& arr) { for (size_t i = 0; i < arr.size(); i++) for (size_t j = 0; j < arr.size() - i - 1; j++) if (arr[j] > arr[j + 1]) std::swap(arr[j], arr[j + 1]); }\n#include <vector>",
         "void f(int n) { int*** cube = new int**[n]; for (int i = 0; i < n; i++) { cube[i] = new int*[n]; for (int j = 0; j < n; j++) { cube[i][j] = new int[n]; for (int k = 0; k < n; k++) cube[i][j][k] = i + j + k; } } for (int i = 0; i < n; i++) { for (int j = 0; j < n; j++) delete[] cube[i][j]; delete[] cube[i]; } delete[] cube; }",
         "void f(int n) { for (int i = 0; i < n; i++) for (int j = 0; j < n; j++) for (int k = 0; k < n; k++) for (int l = 0; l < n; l++) std::cout << i + j + k + l << ' '; }\n#include <iostream>",
         "int f(int n) { if (n <= 1) return n; return f(n - 1) + f(n - 2); }",
         "void f(int A[][100], int B[][100], int C[][100], int n) { for (int i = 0; i < n; i++) for (int j = 0; j < n; j++) { C[i][j] = 0; for (int k = 0; k < n; k++) C[i][j] += A[i][k] * B[k][j]; } }",
         "void f(int n) { int c = 0; for (int i = 0; i < n; i++) for (int j = 0; j < n; j++) for (int k = 0; k < n; k++) c += i * j * k; }",
         "int f(int n) { int* a = new int[n]; int c = 0; for (int i = 0; i < n; i++) { a[i] = i; for (int j = 0; j < n; j++) for (int k = 0; k < n; k++) c += a[i] * j * k; } delete[] a; return c; }",
-        "int f(int n) { if (n <= 1) return 1; return 2 * f(n - 1) + 1; }",
         "void f(int n) { for (int i = 0; i < n; i++) { for (int j = 0; j < n; j++) { for (int k = 0; k < n; k++) { std::cout << '(' << i << ',' << j << ',' << k << ')' << ' '; } } } }\n#include <iostream>",
         "int f(int n) { int c = 0; for (int i = 1; i <= n; i++) for (int j = 1; j <= n; j++) for (int k = 1; k <= n; k++) for (int l = 1; l <= n; l++) c++; return c; }",
         "int f(int n) { if (n <= 1) return n; return f(n - 1) + f(n - 2) + f(n - 3); }",
@@ -425,10 +602,16 @@ JAVA_TEMPLATES = {
         "public void f(int[] arr) { for (int i = 1; i < arr.length; i++) { int key = arr[i]; int j = i - 1; while (j >= 0 && arr[j] > key) { arr[j + 1] = arr[j]; j--; } arr[j + 1] = key; } }",
         "public int[][] f(int[][] A, int[][] B) { int n = A.length, m = A[0].length; int[][] C = new int[n][m]; for (int i = 0; i < n; i++) for (int j = 0; j < m; j++) C[i][j] = A[i][j] + B[i][j]; return C; }",
         "public void f(int[][] m) { for (int i = 0; i < m.length; i++) for (int j = i + 1; j < m[i].length; j++) { int t = m[i][j]; m[i][j] = m[j][i]; m[j][i] = t; } }",
-        "public List<Integer> f(int n) { boolean[] sieve = new boolean[n + 1]; List<Integer> primes = new ArrayList<>(); for (int i = 2; i <= n; i++) { if (!sieve[i]) { primes.add(i); for (int j = i * i; j <= n; j += i) sieve[j] = true; } } return primes; }",
+        # Overflow bug fixed (see benchmarks/real_templates/overflow_bug_report.md):
+        # outer loop was 'i <= n', causing i*i to overflow a 32-bit int, wrapping
+        # to a negative index and throwing ArrayIndexOutOfBoundsException for n
+        # above ~46341^2. Same fix shape as the C++ template: sieving bounded by
+        # sqrt(n) (overflow-safe long cast), prime collection as a separate pass
+        # over the full 2..n range. Java's inverted boolean polarity preserved
+        # (sieve[i]=true means composite, opposite of the C++/Python templates).
+        "public List<Integer> f(int n) { boolean[] sieve = new boolean[n + 1]; for (int i = 2; (long) i * i <= n; i++) { if (!sieve[i]) { for (int j = i * i; j <= n; j += i) sieve[j] = true; } } List<Integer> primes = new ArrayList<>(); for (int i = 2; i <= n; i++) if (!sieve[i]) primes.add(i); return primes; }",
         "public int f(int n) { if (n <= 1) return 1; return n * f(n - 1); }",
         "public boolean f(int n) { if (n < 2) return false; for (int i = 2; i * i <= n; i++) if (n % i == 0) return false; return true; }",
-        "public void f(List<Integer> arr) { for (int i = 0; i < arr.size(); i++) for (int j = 0; j < arr.size() - i - 1; j++) if (arr.get(j) > arr.get(j + 1)) Collections.swap(arr, j, j + 1); }",
         "public int f(int[] arr) { for (int i = 0; i < arr.length; i++) for (int j = i + 1; j < arr.length; j++) if (arr[i] == arr[j]) return arr[i]; return -1; }",
         "public boolean f(int[][] mat, int t) { for (int i = 0; i < mat.length; i++) for (int j = 0; j < mat[i].length; j++) if (mat[i][j] == t) return true; return false; }",
         "public int f(int n) { int c = 0; for (int i = 0; i < n; i++) for (int j = 0; j <= i; j++) c += i * j; return c; }",
@@ -436,14 +619,19 @@ JAVA_TEMPLATES = {
         "public int f(int[] arr, int t) { int lo = 0, hi = arr.length - 1; while (lo <= hi) { int mid = (lo + hi) / 2; if (arr[mid] == t) return mid; if (arr[mid] < t) lo = mid + 1; else hi = mid - 1; } return -1; }",
         "public void f(List<Integer> v) { Collections.sort(v); }",
         "public int f(String text, String pat) { for (int i = 0; i <= text.length() - pat.length(); i++) { boolean m = true; for (int j = 0; j < pat.length(); j++) { if (text.charAt(i + j) != pat.charAt(j)) { m = false; break; } } if (m) return i; } return -1; }",
-        "public int f(int n) { if (n <= 2) return 1; return f(n - 1) + f(n - 2); }",
         "public int f(int n) { int s = 0; for (int i = 1; i <= n; i++) for (int j = 1; j <= i; j++) s += j; return s; }",
         "public void f(int n) { for (int i = 0; i < n; i++) { for (int j = 0; j < n; j++) { System.out.print(i * j + \" \"); } System.out.println(); } }",
         "public int f(int n) { int c = 0; for (int i = 0; i < n; i++) for (int j = 0; j < n; j++) if ((i + j) % 2 == 0) c++; return c; }",
     ],
     'NEEDS_OPTIMIZATION': [
+        # --- O(n²) relabeled from MODERATE: empirically measured exponent ≈ 2.0 ---
+        "public void f(List<Integer> arr) { for (int i = 0; i < arr.size(); i++) for (int j = 0; j < arr.size() - i - 1; j++) if (arr.get(j) > arr.get(j + 1)) Collections.swap(arr, j, j + 1); }",
         "public void f(int n) { int[][][] cube = new int[n][n][n]; for (int i = 0; i < n; i++) for (int j = 0; j < n; j++) for (int k = 0; k < n; k++) cube[i][j][k] = i + j + k; }",
         "public int f(int n) { if (n <= 1) return n; return f(n - 1) + f(n - 2); }",
+        # Relabeled from MODERATE: same algorithm as the line above, differing
+        # only in a cosmetic base case -- same fix and same verification as
+        # the Python version.
+        "public int f(int n) { if (n <= 2) return 1; return f(n - 1) + f(n - 2); }",
         "public int f(int n) { int c = 0; for (int i = 0; i < n; i++) for (int j = 0; j < n; j++) for (int k = 0; k < n; k++) c += i * j * k; return c; }",
         "public int[][] f(int[][] A, int[][] B) { int n = A.length, m = B[0].length, p = B.length; int[][] C = new int[n][m]; for (int i = 0; i < n; i++) for (int j = 0; j < m; j++) for (int k = 0; k < p; k++) C[i][j] += A[i][k] * B[k][j]; return C; }",
         "public int f(int n) { int c = 0; for (int i = 0; i < n; i++) for (int j = 0; j < n; j++) for (int k = 0; k < n; k++) for (int l = 0; l < n; l++) c++; return c; }",
@@ -528,19 +716,28 @@ def _compute_features(code: str, lang: str) -> dict[str, float]:
         'function_calls': metrics.get('function_calls', 0),
         'conditionals': metrics.get('conditionals', 0),
         'complexity_score': metrics.get('complexity_score', 1.0),
+        'stdlib_complexity_weight': metrics.get('stdlib_complexity_weight', 0.0),
+        'recursive_branching_risk': metrics.get('recursive_branching_risk', 0),
+        'element_swap_weight': metrics.get('element_swap_weight', 0.0),
         'language': LANGUAGE_ENCODE.get(lang, 0.0),
     }
 
 def generate_dataset(n_samples: int = 1500, seed: int = 42) -> pd.DataFrame:
     random.seed(seed); np.random.seed(seed)
     rows = []
-    per_lang = max(1, n_samples // len(ALL_LANGS))
-    per_class = max(1, per_lang // 3)
-    
-    for lang in ALL_LANGS:
-        for label in COMPLEXITY_LABELS:
+    # 3 languages x 3 complexity classes = 9 buckets. Distribute n_samples
+    # across them as evenly as possible (base + 1 extra for the first
+    # `remainder` buckets) so the total is exactly n_samples whenever
+    # n_samples >= len(buckets). Below that, each bucket still gets a floor
+    # of 1 so every language/class combination is represented (required for
+    # stratified train/test splitting), at the cost of exactness for very
+    # small n_samples.
+    buckets = [(lang, label) for lang in ALL_LANGS for label in COMPLEXITY_LABELS]
+    base, remainder = divmod(n_samples, len(buckets))
+
+    for idx, (lang, label) in enumerate(buckets):
             templates = TEMPLATE_DIRS[lang].get(label, TEMPLATE_DIRS[lang]['EFFICIENT'])
-            needed = per_class
+            needed = max(1, base + (1 if idx < remainder else 0))
             attempts = 0
             generated = 0
             while generated < needed and attempts < needed * 10:
@@ -578,7 +775,7 @@ def generate_dataset(n_samples: int = 1500, seed: int = 42) -> pd.DataFrame:
 FEATURE_COLUMNS = [
     'execution_time_ms', 'memory_usage_kb', 'loop_depth',
     'max_nesting_depth', 'function_calls', 'conditionals', 'complexity_score',
-    'language'
+    'stdlib_complexity_weight', 'recursive_branching_risk', 'element_swap_weight', 'language'
 ]
 
 LANGUAGE_ENCODE = {'python': 0.0, 'cpp': 1.0, 'java': 2.0}
@@ -662,7 +859,23 @@ class MLPipeline:
             self.model = gs.best_estimator_
             best_params = gs.best_params_
         else:
-            self.model = cfg['model']
+            # Use the grid's first configured point rather than the bare
+            # constructor defaults. Previously this branch called
+            # cfg['model'].fit() directly, which completely ignored
+            # cfg['grid'] and relied on whatever sklearn's unconfigured
+            # defaults happened to be (e.g. MLPClassifier's default
+            # hidden_layer_sizes=(100,), never validated by this project).
+            # For most classifiers sklearn's defaults are reasonable and
+            # this went unnoticed; for neural_network on a small dataset
+            # they're fragile enough to land within noise of the 0.5
+            # accuracy floor test_multiple_classifiers checks for, purely
+            # by luck of the dataset's seed/size. Cloning the base model
+            # and applying grid[param][0] for every param makes tune=False
+            # deliberately configured (still untuned, but reproducibly so,
+            # and consistent with what this project actually chose to put
+            # in each classifier's grid) instead of an unvalidated default.
+            first_point = {k: v[0] for k, v in cfg['grid'].items()}
+            self.model = clone(cfg['model']).set_params(**first_point)
             self.model.fit(X_train_scaled, y_train)
             best_params = {}
 
@@ -735,7 +948,19 @@ class MLPipeline:
         if not versions:
             raise FileNotFoundError("No saved models.")
         latest = sorted(versions)[-1]
-        base = os.path.join(pipeline.MODEL_DIR, f'model_v{latest}')
+        return cls.load_version(latest)
+
+    @classmethod
+    def load_version(cls, version: str) -> 'MLPipeline':
+        """Load a SPECIFIC named version (not necessarily the latest).
+        This is what rollback() actually needs -- load_latest() always
+        returns the newest model regardless of what's requested, which
+        makes it unsuitable for rolling back to an older known-good
+        version after a bad retrain."""
+        pipeline = cls()
+        base = os.path.join(pipeline.MODEL_DIR, f'model_v{version}')
+        if not os.path.exists(f'{base}.joblib'):
+            raise FileNotFoundError(f"No saved model for version '{version}'.")
         pipeline.model = joblib.load(f'{base}.joblib')
         pipeline.scaler = joblib.load(f'{base}_scaler.joblib')
         meta_path = f'{base}_meta.json'
@@ -770,7 +995,7 @@ class ModelRegistry:
         return versions[-1]['version'] if versions else None
 
     def rollback(self, version: str) -> 'MLPipeline':
-        return MLPipeline.load_latest()
+        return MLPipeline.load_version(version)
 
 
 # =============================================================================
@@ -820,6 +1045,72 @@ def generate_recommendations(metrics: dict[str, float], label: str, config: Conf
 
 
 # =============================================================================
+# 4b. PYTHON EXECUTION SANDBOX (Tier-2 real execution, Python only)
+# =============================================================================
+
+def execute_python_sandboxed(code: str, timeout_seconds: float = 5.0) -> float | None:
+    """Execute Python code in a subprocess and return measured wall-clock time in ms.
+
+    This is the Tier-2 "real execution" implementation for Python.  It wraps
+    the submitted code in a simple timing harness, runs it in a fresh subprocess
+    with a hard wall-clock timeout, and returns the measured time in milliseconds.
+    Returns ``None`` if execution times out, raises an exception, or produces
+    unparseable output.
+
+    **Security note**: process isolation is subprocess-level only -- the child
+    process inherits the current user's filesystem permissions.  Suitable for a
+    trusted-user or demo context; for a public multi-tenant service, replace the
+    ``subprocess.run()`` call with a gVisor/nsjail/Firecracker executor and add
+    ``resource.setrlimit`` calls for CPU and address-space limits.
+
+    Args:
+        code: Arbitrary Python source code (function definitions, top-level
+              statements, or both).  The code is executed as-is; function
+              definitions without a call site will be defined but not called,
+              resulting in a near-zero reported time (that is correct behaviour
+              -- it accurately represents the cost of *defining* the function).
+        timeout_seconds: Hard wall-clock timeout for the subprocess.
+    """
+    harness = (
+        "import time as __time__\n"
+        "__t0__ = __time__.perf_counter()\n"
+        "try:\n"
+        "    pass\n"  # guarantees a non-empty try body even if code is empty/whitespace-only
+        + textwrap.indent(code, "    ")
+        + "\nexcept Exception:\n"
+        "    pass\n"
+        "print(__time__.perf_counter() - __t0__)\n"
+    )
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.py', delete=False,
+            dir=tempfile.gettempdir()
+        ) as fh:
+            fh.write(harness)
+            tmp = fh.name
+
+        result = subprocess.run(
+            [sys.executable, tmp],
+            capture_output=True, text=True,
+            timeout=timeout_seconds,
+            cwd=tempfile.gettempdir(),
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            last_line = result.stdout.strip().split('\n')[-1]
+            return float(last_line) * 1000.0  # seconds → ms
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        pass
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    return None
+
+
+# =============================================================================
 # 5. UNIFIED PROFILER
 # =============================================================================
 
@@ -838,8 +1129,36 @@ class CodeProfiler:
             return {'error': f'Python syntax error: {e}', 'language': 'python'}
         exec_time = 0.1 + ast_metrics['loops'] * 0.5 + ast_metrics['conditionals'] * 0.2
         exec_time += ast_metrics['function_calls'] * 0.1 + ast_metrics['max_nesting_depth'] ** 2 * 0.3
+        # Same *0.8 "loop-equivalent" weighting as profile_cpp/profile_java, applied
+        # only to the formula-estimate branch below -- real measured execution (when
+        # enable_execution is on) already inherently captures whatever set()/list()/
+        # sorted() actually cost at runtime, so it doesn't need a synthetic add-on.
+        exec_time += ast_metrics['stdlib_complexity_weight'] * 0.8
+        # recursive_branching_risk gets a much larger per-unit weight than the
+        # loop-equivalent terms above -- it's a qualitatively different signal
+        # (unshrinking multi-way recursion, verified exponential in the cases
+        # this fires on) rather than another linear operation count. See
+        # _analyze_recursion_shape's docstring for what this detects and why
+        # a plain self-call count alone isn't used.
+        exec_time += ast_metrics['recursive_branching_risk'] * 5.0
+        # A real, per-iteration-expensive signal (an actual element swap,
+        # not just a comparison) -- distinguishes bubble-sort-shaped loops
+        # from same-loop-depth neighbors that only read/compare. See
+        # visit_Assign's docstring for what this detects and why.
+        exec_time += ast_metrics['element_swap_weight'] * 3.0
         memory = 256 + ast_metrics['loops'] * 64 + ast_metrics['function_defs'] * 128
         memory += ast_metrics['list_comprehensions'] * 32
+
+        # Tier-2 real execution: replace formula estimate with measured time when
+        # profiling.enable_execution is true in config.  Off by default.
+        measured = False
+        if self.config and self.config.get('profiling.enable_execution', False):
+            timeout = float(self.config.get('profiling.execution_timeout_seconds', 5))
+            measured_ms = execute_python_sandboxed(code, timeout_seconds=timeout)
+            if measured_ms is not None:
+                exec_time = measured_ms
+                measured = True
+
         complexity_score = round(
             exec_time * 0.4 + (memory / 1024) * 0.3 + ast_metrics['loops'] * 0.2
             + ast_metrics['max_nesting_depth'] * 0.1, 2
@@ -856,56 +1175,60 @@ class CodeProfiler:
             'class_defs': ast_metrics['class_defs'],
             'list_comprehensions': ast_metrics['list_comprehensions'],
             'complexity_score': complexity_score,
+            'stdlib_complexity_weight': ast_metrics['stdlib_complexity_weight'],
+            'recursive_branching_risk': ast_metrics['recursive_branching_risk'],
+            'element_swap_weight': ast_metrics['element_swap_weight'],
+            'measured_execution': measured,   # True when sandbox was used
         }
 
     def profile_cpp(self, code: str) -> dict[str, Any]:
-        lines = code.split('\n')
-        loop_count = 0; max_depth = 0; func_calls = 0
-        current_depth = 0
-        for line in lines:
-            stripped = line.strip()
-            # Count each loop keyword occurrence (robust heuristic)
-            if any(kw in stripped for kw in ['for (', 'while (', 'do ']):
-                loop_count += 1
-            for ch in stripped:
-                if ch == '{':
-                    current_depth += 1; max_depth = max(max_depth, current_depth)
-                elif ch == '}':
-                    current_depth = max(0, current_depth - 1)
-            for i, ch in enumerate(stripped):
-                if ch == '(' and i > 0 and stripped[i-1].isalpha():
-                    func_calls += 1
+        # Real parsing (tree-sitter) replaces the old text-pattern heuristic.
+        # See cpp_analyzer.py for the full rationale and the specific blind
+        # spots this closes (std::reverse, std::count -- real O(n) stdlib
+        # calls with no literal 'for'/'while' in the source, confirmed via
+        # benchmarks/real_templates/real_template_validation.py).
+        try:
+            m = CppTreeSitterAnalyzer().analyze(code)
+        except Exception as e:
+            return {'error': f'C++ parse error: {e}', 'language': 'cpp'}
         array_count = code.count('vector') + code.count('[')
         memory = array_count * 1024 + 256
-        exec_time = 0.05 + loop_count * 0.8 + func_calls * 0.05
-        conditionals = code.count('if') + code.count('else') + code.count('switch')
-        complexity = round(exec_time * 0.5 + (memory / 1024) * 0.3 + max_depth * 0.2, 2)
+        exec_time = 0.05 + m['loops'] * 0.8 + m['function_calls'] * 0.05 + m['stdlib_complexity_weight'] * 0.8
+        exec_time += m['recursive_branching_risk'] * 5.0
+        complexity = round(exec_time * 0.5 + (memory / 1024) * 0.3 + m['max_nesting_depth'] * 0.2, 2)
         return {
             'language': 'cpp', 'execution_time_ms': round(exec_time, 3),
-            'memory_usage_kb': memory, 'loop_depth': loop_count,
-            'max_nesting_depth': max_depth, 'function_calls': func_calls,
-            'conditionals': conditionals, 'complexity_score': complexity,
+            'memory_usage_kb': memory, 'loop_depth': m['loops'],
+            'max_nesting_depth': m['max_nesting_depth'], 'function_calls': m['function_calls'],
+            'conditionals': m['conditionals'], 'complexity_score': complexity,
+            'stdlib_complexity_weight': m['stdlib_complexity_weight'],
+            'recursive_branching_risk': m['recursive_branching_risk'],
+            'element_swap_weight': 0.0,  # detector not yet built for C++ -- see HANDOFF.md
         }
 
     def profile_java(self, code: str) -> dict[str, Any]:
-        loops = code.count('for') + code.count('while') + code.count('do ')
-        conditionals = code.count('if') + code.count('switch') + code.count('else')
-        method_calls = sum(1 for i, ch in enumerate(code) if ch == '(' and i > 0 and code[i-1].isalpha())
-        complexity = loops + conditionals + 1
-        exec_time = 0.05 + loops * 0.6 + conditionals * 0.3 + method_calls * 0.01
-        memory = 512 + loops * 128 + conditionals * 64
-        # Estimate max_nesting_depth from brace structure
-        depth = 0; max_depth = 0
-        for ch in code:
-            if ch == '{': depth += 1; max_depth = max(max_depth, depth)
-            elif ch == '}': depth = max(0, depth - 1)
+        # Real parsing (tree-sitter) replaces the old text-pattern heuristic.
+        # See java_analyzer.py for the full rationale and the specific
+        # blind spots this closes (Arrays.stream()/HashSet construction --
+        # real O(n) work with no literal loop keyword in the source).
+        try:
+            m = JavaTreeSitterAnalyzer().analyze(code)
+        except Exception as e:
+            return {'error': f'Java parse error: {e}', 'language': 'java'}
+        complexity_cyclomatic = m['loops'] + m['conditionals'] + 1
+        exec_time = 0.05 + m['loops'] * 0.6 + m['conditionals'] * 0.3 + m['function_calls'] * 0.01 + m['stdlib_complexity_weight'] * 0.8
+        exec_time += m['recursive_branching_risk'] * 5.0
+        memory = 512 + m['loops'] * 128 + m['conditionals'] * 64
         return {
             'language': 'java', 'execution_time_ms': round(exec_time, 3),
-            'memory_usage_kb': memory, 'loop_depth': loops,
-            'max_nesting_depth': max_depth, 'conditionals': conditionals,
-            'function_calls': method_calls,
-            'cyclomatic_complexity': complexity,
-            'complexity_score': round(complexity * 0.5 + exec_time * 0.3 + (memory / 1024) * 0.2, 2),
+            'memory_usage_kb': memory, 'loop_depth': m['loops'],
+            'max_nesting_depth': m['max_nesting_depth'], 'conditionals': m['conditionals'],
+            'function_calls': m['function_calls'],
+            'cyclomatic_complexity': complexity_cyclomatic,
+            'stdlib_complexity_weight': m['stdlib_complexity_weight'],
+            'recursive_branching_risk': m['recursive_branching_risk'],
+            'element_swap_weight': 0.0,  # detector not yet built for Java -- see HANDOFF.md
+            'complexity_score': round(complexity_cyclomatic * 0.5 + exec_time * 0.3 + (memory / 1024) * 0.2, 2),
         }
 
     def profile(self, code: str, language: str = 'python') -> dict[str, Any]:

@@ -1,0 +1,36 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local-only artifacts that shouldn't leak into the image -- the Dockerfile
+# trains its own model and creates its own logs dir at build/run time.
+models/
+logs/
+*.db
+profile_results.json
+
+# Benchmark scratch output -- never needed inside the served image.
+benchmarks/real_templates/cpp_gen/
+benchmarks/real_templates/java_gen/
+benchmarks/real_templates/*.json
+benchmarks/*.json
+
+# Stale/personal files already excluded from git; keep them out of the
+# build context too in case they exist locally.
+portfolio.html
+Intellix_Production_Implementation_Prompt.md
+cpp_profiler.cpp.txt
+java_profiler.java
+app.js
+styles.css

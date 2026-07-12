@@ -1,0 +1,398 @@
+[
+  {
+    "language": "python",
+    "benchmark": "mod_check",
+    "n_values": [
+      10000,
+      100000,
+      1000000
+    ],
+    "timings_ms": [
+      0.0004949999947712058,
+      0.00024100000928228837,
+      0.00015700004496466136
+    ],
+    "pairwise_exponents": [
+      -0.313,
+      -0.186
+    ],
+    "growth_exponent_avg": -0.249,
+    "measured_label": "EFFICIENT",
+    "intended_label": "EFFICIENT",
+    "result": "MATCH"
+  },
+  {
+    "language": "python",
+    "benchmark": "sqrt_calc",
+    "n_values": [
+      10000,
+      100000,
+      1000000
+    ],
+    "timings_ms": [
+      0.0006399999961104186,
+      0.0001610000026630587,
+      0.00012600003174156882
+    ],
+    "pairwise_exponents": [
+      -0.599,
+      -0.106
+    ],
+    "growth_exponent_avg": -0.353,
+    "measured_label": "EFFICIENT",
+    "intended_label": "EFFICIENT",
+    "result": "MATCH"
+  },
+  {
+    "language": "python",
+    "benchmark": "linear_sum",
+    "n_values": [
+      10000,
+      50000,
+      200000
+    ],
+    "timings_ms": [
+      0.3009029999816448,
+      1.6642420000039237,
+      7.166844999972
+    ],
+    "pairwise_exponents": [
+      1.063,
+      1.053
+    ],
+    "growth_exponent_avg": 1.058,
+    "measured_label": "MODERATE",
+    "intended_label": "MODERATE",
+    "result": "MATCH"
+  },
+  {
+    "language": "python",
+    "benchmark": "sort_n",
+    "n_values": [
+      10000,
+      50000,
+      200000
+    ],
+    "timings_ms": [
+      0.18511199999693417,
+      0.9900600000491977,
+      5.156904999978451
+    ],
+    "pairwise_exponents": [
+      1.042,
+      1.19
+    ],
+    "growth_exponent_avg": 1.116,
+    "measured_label": "MODERATE",
+    "intended_label": "MODERATE",
+    "result": "MATCH"
+  },
+  {
+    "language": "python",
+    "benchmark": "quadratic_pairs",
+    "n_values": [
+      500,
+      1000,
+      2000
+    ],
+    "timings_ms": [
+      6.6441289999943365,
+      28.86954699999933,
+      119.30210299999544
+    ],
+    "pairwise_exponents": [
+      2.119,
+      2.047
+    ],
+    "growth_exponent_avg": 2.083,
+    "measured_label": "NEEDS_OPTIMIZATION",
+    "intended_label": "NEEDS_OPTIMIZATION",
+    "result": "MATCH"
+  },
+  {
+    "language": "python",
+    "benchmark": "naive_fib",
+    "n_values": [
+      20,
+      25,
+      28
+    ],
+    "timings_ms": [
+      0.9240100000056373,
+      10.347797999997965,
+      43.304784999975254
+    ],
+    "pairwise_exponents": [
+      10.826,
+      12.631
+    ],
+    "growth_exponent_avg": 11.729,
+    "measured_label": "NEEDS_OPTIMIZATION",
+    "intended_label": "NEEDS_OPTIMIZATION",
+    "result": "MATCH"
+  },
+  {
+    "language": "cpp",
+    "benchmark": "mod_check",
+    "n_values": [
+      1000000,
+      10000000,
+      100000000
+    ],
+    "timings_ms": [
+      9.5e-05,
+      8.7e-05,
+      9.1e-05
+    ],
+    "pairwise_exponents": [
+      -0.038,
+      0.02
+    ],
+    "growth_exponent_avg": -0.009,
+    "measured_label": "EFFICIENT",
+    "intended_label": "EFFICIENT",
+    "result": "MATCH"
+  },
+  {
+    "language": "cpp",
+    "benchmark": "sqrt_calc",
+    "n_values": [
+      1000000,
+      10000000,
+      100000000
+    ],
+    "timings_ms": [
+      9.7e-05,
+      9.4e-05,
+      9.7e-05
+    ],
+    "pairwise_exponents": [
+      -0.014,
+      0.014
+    ],
+    "growth_exponent_avg": -0.0,
+    "measured_label": "EFFICIENT",
+    "intended_label": "EFFICIENT",
+    "result": "MATCH"
+  },
+  {
+    "language": "cpp",
+    "benchmark": "linear_sum",
+    "n_values": [
+      10000000,
+      50000000,
+      200000000
+    ],
+    "timings_ms": [
+      2.41703,
+      12.1984,
+      48.4891
+    ],
+    "pairwise_exponents": [
+      1.006,
+      0.995
+    ],
+    "growth_exponent_avg": 1.001,
+    "measured_label": "MODERATE",
+    "intended_label": "MODERATE",
+    "result": "MATCH"
+  },
+  {
+    "language": "cpp",
+    "benchmark": "sort_n",
+    "n_values": [
+      1000000,
+      5000000,
+      20000000
+    ],
+    "timings_ms": [
+      12.0042,
+      75.5338,
+      334.148
+    ],
+    "pairwise_exponents": [
+      1.143,
+      1.073
+    ],
+    "growth_exponent_avg": 1.108,
+    "measured_label": "MODERATE",
+    "intended_label": "MODERATE",
+    "result": "MATCH"
+  },
+  {
+    "language": "cpp",
+    "benchmark": "quadratic_pairs",
+    "n_values": [
+      2000,
+      4000,
+      8000
+    ],
+    "timings_ms": [
+      2.88713,
+      18.0136,
+      76.6262
+    ],
+    "pairwise_exponents": [
+      2.641,
+      2.089
+    ],
+    "growth_exponent_avg": 2.365,
+    "measured_label": "NEEDS_OPTIMIZATION",
+    "intended_label": "NEEDS_OPTIMIZATION",
+    "result": "MATCH"
+  },
+  {
+    "language": "cpp",
+    "benchmark": "naive_fib",
+    "n_values": [
+      30,
+      35,
+      38
+    ],
+    "timings_ms": [
+      1.72401,
+      18.6644,
+      73.6647
+    ],
+    "pairwise_exponents": [
+      15.452,
+      16.694
+    ],
+    "growth_exponent_avg": 16.073,
+    "measured_label": "NEEDS_OPTIMIZATION",
+    "intended_label": "NEEDS_OPTIMIZATION",
+    "result": "MATCH"
+  },
+  {
+    "language": "java",
+    "benchmark": "mod_check",
+    "n_values": [
+      1000000,
+      10000000,
+      100000000
+    ],
+    "timings_ms": [
+      0.000969,
+      0.000915,
+      0.000893
+    ],
+    "pairwise_exponents": [
+      -0.025,
+      -0.011
+    ],
+    "growth_exponent_avg": -0.018,
+    "measured_label": "EFFICIENT",
+    "intended_label": "EFFICIENT",
+    "result": "MATCH"
+  },
+  {
+    "language": "java",
+    "benchmark": "sqrt_calc",
+    "n_values": [
+      1000000,
+      10000000,
+      100000000
+    ],
+    "timings_ms": [
+      0.010424,
+      0.010508,
+      0.010396
+    ],
+    "pairwise_exponents": [
+      0.003,
+      -0.005
+    ],
+    "growth_exponent_avg": -0.001,
+    "measured_label": "EFFICIENT",
+    "intended_label": "EFFICIENT",
+    "result": "MATCH"
+  },
+  {
+    "language": "java",
+    "benchmark": "linear_sum",
+    "n_values": [
+      10000000,
+      50000000,
+      200000000
+    ],
+    "timings_ms": [
+      120.38475,
+      600.767242,
+      2423.625843
+    ],
+    "pairwise_exponents": [
+      0.999,
+      1.006
+    ],
+    "growth_exponent_avg": 1.002,
+    "measured_label": "MODERATE",
+    "intended_label": "MODERATE",
+    "result": "MATCH"
+  },
+  {
+    "language": "java",
+    "benchmark": "sort_n",
+    "n_values": [
+      1000000,
+      5000000,
+      20000000
+    ],
+    "timings_ms": [
+      41.790334,
+      212.335587,
+      862.576337
+    ],
+    "pairwise_exponents": [
+      1.01,
+      1.011
+    ],
+    "growth_exponent_avg": 1.011,
+    "measured_label": "MODERATE",
+    "intended_label": "MODERATE",
+    "result": "MATCH"
+  },
+  {
+    "language": "java",
+    "benchmark": "quadratic_pairs",
+    "n_values": [
+      2000,
+      4000,
+      8000
+    ],
+    "timings_ms": [
+      63.647859,
+      262.500573,
+      1027.727447
+    ],
+    "pairwise_exponents": [
+      2.044,
+      1.969
+    ],
+    "growth_exponent_avg": 2.007,
+    "measured_label": "NEEDS_OPTIMIZATION",
+    "intended_label": "NEEDS_OPTIMIZATION",
+    "result": "MATCH"
+  },
+  {
+    "language": "java",
+    "benchmark": "naive_fib",
+    "n_values": [
+      30,
+      35,
+      38
+    ],
+    "timings_ms": [
+      56.017725,
+      614.164305,
+      2600.524159
+    ],
+    "pairwise_exponents": [
+      15.534,
+      17.549
+    ],
+    "growth_exponent_avg": 16.542,
+    "measured_label": "NEEDS_OPTIMIZATION",
+    "intended_label": "NEEDS_OPTIMIZATION",
+    "result": "MATCH"
+  }
+]

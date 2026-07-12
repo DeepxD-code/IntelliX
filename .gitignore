@@ -27,6 +27,11 @@ logs/
 # Database
 *.db
 
+# Benchmark scratch output -- compiled binaries/classfiles are
+# environment-specific, same reasoning as gitignoring models/.
+benchmarks/real_templates/cpp_gen/
+benchmarks/real_templates/java_gen/
+
 # IDE
 .vscode/
 .idea/

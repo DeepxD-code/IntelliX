@@ -24,7 +24,6 @@ from profiler_main import (
 )
 
 app = Flask(__name__)
-CORS(app)
 
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024
 app.config['SWAGGER'] = {
@@ -41,6 +40,53 @@ config = ConfigManager()
 setup_logging(config)
 logger = logging.getLogger(__name__)
 
+# --- CORS: scoped to the configured frontend origin(s), not wide open. ---
+# A bare CORS(app) allows any origin to call this API from a browser.
+# For a single-origin demo deployment (the same app serves both the UI
+# and the API) this is unnecessary exposure. ALLOWED_ORIGINS can be set
+# via env var for whatever the actual deployed frontend origin is;
+# defaults to the server's own host:port for the common case of the
+# Flask app serving its own UI.
+_allowed_origins = os.environ.get('ALLOWED_ORIGINS', '').strip()
+if _allowed_origins:
+    origins = [o.strip() for o in _allowed_origins.split(',') if o.strip()]
+else:
+    origins = []  # same-origin only; no cross-origin browser calls permitted
+CORS(app, origins=origins if origins else None, resources={r"/api/*": {"origins": origins or []}})
+
+# --- Rate limiting: actually enforce config.yaml's server.max_requests_per_minute,
+# which previously existed only as an unused config value. ---
+# IMPORTANT: in-memory storage is only correct with a SINGLE worker process --
+# each gunicorn worker would otherwise keep its own independent counter,
+# silently multiplying the real limit by worker count. The paired fix is
+# gunicorn.conf.py defaulting to workers=1 with multiple threads (threads
+# share process memory; separate worker processes don't). If you scale to
+# multiple workers or multiple machine instances, set RATELIMIT_STORAGE_URI
+# to a shared backend (e.g. redis://...) -- otherwise this silently breaks
+# again in the same way it was broken before this fix.
+try:
+    from flask_limiter import Limiter
+    from flask_limiter.util import get_remote_address
+
+    _rpm = config.get('server.max_requests_per_minute', 100)
+    _storage_uri = os.environ.get('RATELIMIT_STORAGE_URI', 'memory://')
+    limiter = Limiter(
+        get_remote_address,
+        app=app,
+        default_limits=[f"{_rpm} per minute"],
+        storage_uri=_storage_uri,
+    )
+    logger.info(f"Rate limiting enabled: {_rpm} requests/minute per client (storage={_storage_uri})")
+    if _storage_uri == 'memory://':
+        logger.warning("Rate limiter storage is in-process memory -- correct ONLY with a "
+                        "single worker process (see gunicorn.conf.py). Set "
+                        "RATELIMIT_STORAGE_URI to a shared backend before running multiple "
+                        "workers or multiple instances.")
+except ImportError:
+    limiter = None
+    logger.warning("flask-limiter not installed -- rate limiting is NOT enforced. "
+                    "Add flask-limiter to requirements.txt before deploying.")
+
 profiler = None
 ml_pipeline = None
 model_info = {}
@@ -50,7 +96,14 @@ DB_PATH = os.path.join(os.path.dirname(__file__), 'profile_history.db')
 
 def get_db():
     if 'db' not in g:
-        g.db = sqlite3.connect(DB_PATH)
+        # timeout= is SQLite's busy_timeout (seconds to wait on a lock before
+        # raising "database is locked", default is only 5s). WAL mode lets
+        # readers proceed without blocking on a writer (and vice versa) --
+        # SQLite still serializes writers, but this meaningfully improves
+        # tolerance for concurrent request traffic over the bare defaults.
+        g.db = sqlite3.connect(DB_PATH, timeout=10)
+        g.db.execute("PRAGMA journal_mode=WAL")
+        g.db.execute("PRAGMA busy_timeout=10000")
         g.db.execute("""
             CREATE TABLE IF NOT EXISTS profiles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,6 +143,12 @@ def init_backend():
             'classifier': ml_pipeline.classifier_type,
         }
     except (FileNotFoundError, Exception) as e:
+        # NOTE: this fallback path is intentionally slow (full GridSearchCV
+        # per config.yaml's hyperparameter_tuning=true) and should not run
+        # at request-serving time in production. The Dockerfile now trains
+        # and bakes a model in at build time specifically so this branch is
+        # never hit on a real deploy. It's kept as a graceful fallback for
+        # local/dev use without Docker.
         logger.info(f"No saved model found ({e}). Training new model...")
         n = config.get('dataset.n_samples', 500)
         ctype = config.get('ml_model.classifier_type', 'random_forest')
@@ -114,12 +173,26 @@ init_backend()
 
 @app.route('/')
 def index():
-    return render_template('portfolio.html', model_info={
-        'accuracy': model_info.get('accuracy', 0),
-        'f1_score': model_info.get('f1_score', 0),
-        'classifier': model_info.get('classifier', 'random_forest'),
-        'features': FEATURE_COLUMNS,
-        'classes': COMPLEXITY_LABELS,
+    """API root. Previously rendered templates/portfolio.html (a themed
+    showcase + live-analyzer page); that template contained stale
+    collaborator names and an institutional reference inconsistent with
+    this project's current solo status and was removed. No replacement
+    template exists on purpose -- this returns a minimal JSON descriptor
+    instead, consistent with the project's REST-API-first design (Swagger
+    docs, MCP server) rather than introducing a new HTML page.
+    """
+    return jsonify({
+        'name': 'IntelliProfile API',
+        'description': 'ML-powered code complexity profiler for Python, C++, and Java',
+        'docs': '/api/docs',
+        'health': '/api/health',
+        'model': {
+            'accuracy': model_info.get('accuracy', 0),
+            'f1_score': model_info.get('f1_score', 0),
+            'classifier': model_info.get('classifier', 'random_forest'),
+            'features': FEATURE_COLUMNS,
+            'classes': COMPLEXITY_LABELS,
+        },
     })
 
 
@@ -142,13 +215,16 @@ def index():
     }
 })
 def api_health():
-    return jsonify({
-        'status': 'healthy',
+    is_ready = profiler is not None and ml_pipeline is not None and ml_pipeline.model is not None
+    response = jsonify({
+        'status': 'healthy' if is_ready else 'unhealthy',
         'model_accuracy': model_info.get('accuracy', 0),
         'model_f1': model_info.get('f1_score', 0),
         'uptime_seconds': round(time.time() - app.start_time, 2),
         'languages': ['python', 'cpp', 'java'],
     })
+    response.status_code = 200 if is_ready else 503
+    return response
 
 
 @app.route('/api/profile', methods=['POST'])
@@ -217,7 +293,7 @@ def api_profile():
         return jsonify({'error': f'Syntax error: {e}'}), 400
     except Exception as e:
         logger.error(f"Profile error: {e}", exc_info=True)
-        return jsonify({'error': f'Internal error: {e}'}), 500
+        return jsonify({'error': 'Internal error processing this request.'}), 500
 
 
 @app.route('/api/batch-profile', methods=['POST'])
@@ -253,11 +329,12 @@ def api_profile():
 def api_batch_profile():
     data = request.get_json(force=True)
     snippets = data.get('snippets', [])
+    max_batch = config.get('server.max_batch_size', 50)
 
     if not snippets:
         return jsonify({'error': 'No snippets provided'}), 400
-    if len(snippets) > 50:
-        return jsonify({'error': 'Maximum 50 snippets per batch'}), 400
+    if len(snippets) > max_batch:
+        return jsonify({'error': f'Maximum {max_batch} snippets per batch'}), 400
 
     results = []
     errors = []
@@ -278,7 +355,8 @@ def api_batch_profile():
             else:
                 results.append(result)
         except Exception as e:
-            errors.append({'index': i, 'error': str(e)})
+            logger.error(f"Batch profile error at index {i}: {e}", exc_info=True)
+            errors.append({'index': i, 'error': 'Internal error processing this snippet.'})
 
     return jsonify({
         'total': len(snippets),
@@ -363,6 +441,37 @@ def api_history():
 @app.route('/api/docs')
 def api_docs():
     return render_template('swagger.html')
+
+
+@app.after_request
+def set_security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    return response
+
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({'error': 'Not found'}), 404
+
+
+@app.errorhandler(413)
+def payload_too_large(e):
+    return jsonify({'error': 'Request payload too large'}), 413
+
+
+@app.errorhandler(429)
+def rate_limited(e):
+    return jsonify({'error': 'Rate limit exceeded. Please slow down.'}), 429
+
+
+@app.errorhandler(500)
+def server_error(e):
+    # Generic message only -- never leak exception details/tracebacks to
+    # the client, regardless of how the error originated.
+    logger.error(f"Unhandled server error: {e}", exc_info=True)
+    return jsonify({'error': 'Internal server error'}), 500
 
 
 if __name__ == '__main__':

@@ -142,7 +142,6 @@ def test_history_endpoint(t):
         else:
             t.add("GET /api/history has total + results", "FAIL", str(list(data.keys())))
 
-        # Profile something first so history isn't empty
         c.post('/api/profile', json={'code': 'def f(): return 1', 'language': 'python'})
         resp = c.get('/api/history?limit=10')
         data = resp.get_json()
@@ -156,9 +155,15 @@ def test_index_page(t):
     with app.test_client() as c:
         resp = c.get('/')
         if resp.status_code == 200:
-            t.add("GET / serves portfolio.html", "PASS")
+            t.add("GET / returns 200", "PASS")
         else:
-            t.add("GET / serves portfolio.html", "FAIL", f"status={resp.status_code}")
+            t.add("GET / returns 200", "FAIL", f"status={resp.status_code}")
+            return
+        data = resp.get_json()
+        if data and 'docs' in data and 'health' in data and 'model' in data:
+            t.add("GET / returns API descriptor with docs/health/model", "PASS")
+        else:
+            t.add("GET / returns API descriptor with docs/health/model", "FAIL", str(data))
 
 
 def run_api_tests():

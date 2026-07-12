@@ -11,18 +11,24 @@ import tempfile
 
 # Ensure we import the module under test
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cpp_analyzer import CppTreeSitterAnalyzer
+from java_analyzer import JavaTreeSitterAnalyzer
 from profiler_main import (
     CLASSIFIERS,
     COMPLEXITY_LABELS,
+    CPP_TEMPLATES,
     FEATURE_COLUMNS,
+    JAVA_TEMPLATES,
+    PYTHON_TEMPLATES,
     CodeProfiler,
     ConfigError,
     ConfigManager,
     MLPipeline,
     ModelRegistry,
     PythonASTAnalyzer,
-    _compute_synthetic_metrics,
-    _generate_python_snippet,
+    _compute_features,
+    _generate_program,
+    execute_python_sandboxed,
     generate_dataset,
     generate_recommendations,
     main,
@@ -275,7 +281,7 @@ class TestResult:
 
 
 def test_ast_analyzer(t: TestResult):
-    print("  [PythonASTAnalyzer] Testing all 10 visitor methods + edge cases...")
+    print("  [PythonASTAnalyzer] Testing all 11 visitor methods + edge cases...")
 
     PythonASTAnalyzer()
 
@@ -291,6 +297,25 @@ def test_ast_analyzer(t: TestResult):
         ("ListComp", "[x for x in range(10)]", {'list_comprehensions': 1, 'loops': 1, 'max_nesting_depth': 1}),
         ("SetComp", "{x for x in range(10)}", {'list_comprehensions': 1, 'loops': 1, 'max_nesting_depth': 1}),
         ("DictComp", "{k:v for k,v in d.items()}", {'list_comprehensions': 1, 'loops': 1, 'max_nesting_depth': 1}),
+        # GeneratorExp: the documented blind spot (visit_GeneratorExp was missing).
+        # sum(i*i for i in range(n)) must report loops=1, depth=1, comps=1,
+        # NOT loops=0 (the old silent failure). Regression test for the fix.
+        ("GeneratorExp simple", "sum(i * i for i in range(n))", {'list_comprehensions': 1, 'loops': 1, 'max_nesting_depth': 1}),
+        ("GeneratorExp in any()", "any(x > 0 for x in arr)", {'list_comprehensions': 1, 'loops': 1, 'max_nesting_depth': 1}),
+        ("GeneratorExp nested", "list(x+y for x in a for y in b)", {'list_comprehensions': 1, 'loops': 2, 'max_nesting_depth': 1}),
+        ("GeneratorExp + for", "for i in r:\n    s = sum(x for x in r)", {'loops': 2, 'max_nesting_depth': 2, 'list_comprehensions': 1}),
+        # KNOWN_COMPLEXITY / stdlib_complexity_weight: the documented Python
+        # blind spot (py_set_dedup in the real-template audit). Regression
+        # tests for the fix, including the deliberate genexpr-fusion exception.
+        ("list(set(x)) blind spot", "def f(lst):\n    return list(set(lst))", {'stdlib_complexity_weight': 2.0}),
+        ("bare set(x)", "def f(x):\n    return set(x)", {'stdlib_complexity_weight': 1.0}),
+        ("empty set() -- O(1), not weighted", "def f():\n    return set()", {'stdlib_complexity_weight': 0.0}),
+        ("sorted(x)", "def f(x):\n    return sorted(x)", {'stdlib_complexity_weight': 1.5}),
+        ("sum(genexpr) -- fused, no extra weight", "def f(n):\n    return sum(i*i for i in range(n))", {'stdlib_complexity_weight': 0.0, 'loops': 1}),
+        ("sum([listcomp]) -- eager, weighted", "def f(n):\n    return sum([i for i in range(n)])", {'stdlib_complexity_weight': 1.0, 'loops': 1}),
+        ("max(a,b) two scalars -- not weighted", "def f(a,b):\n    return max(a,b)", {'stdlib_complexity_weight': 0.0}),
+        ("max(arr) one iterable -- weighted", "def f(arr):\n    return max(arr)", {'stdlib_complexity_weight': 1.0}),
+        ("obj.set(x) method call -- not a builtin", "def f(obj,x):\n    return obj.set(x)", {'stdlib_complexity_weight': 0.0}),
         ("Lambda", "lambda x: x + 1", {'lambda_functions': 1}),
         ("Try", "try:\n    pass\nexcept:\n    pass", {'try_except_blocks': 1}),
         ("Nested depth", "def f():\n    for i in r:\n        for j in r:\n            pass", {'function_defs': 1, 'loops': 2, 'max_nesting_depth': 2}),
@@ -324,23 +349,374 @@ def test_ast_analyzer(t: TestResult):
             t.add(f"AST edge: {name}", "FAIL", str(e))
 
 
+def test_recursion_and_swap_detection(t: TestResult):
+    """Tests for recursive_branching_risk (Python/C++/Java) and
+    element_swap_weight (Python only). Both were added to fix specific,
+    verified mismatches between the trained model's predictions and the
+    templates' own intended labels -- naive Fibonacci-style exponential
+    recursion, and bubble-sort-style in-place swaps. Both detectors were
+    validated by sweeping every existing template before being trusted;
+    these tests lock that sweep in as a permanent regression check so a
+    future template addition can't silently reintroduce a false positive
+    (flagging a currently-correct divide-and-conquer or non-swap template).
+    """
+    print("  [recursive_branching_risk / element_swap_weight] Sanity + full-corpus sweep...")
+
+    from cpp_analyzer import CppTreeSitterAnalyzer
+    from java_analyzer import JavaTreeSitterAnalyzer
+
+    # --- Sanity checks: known-dangerous and known-safe shapes, all 3 languages ---
+    py_cases = [
+        ("naive fibonacci", "def f(n):\n    if n<=1: return n\n    return f(n-1)+f(n-2)", 2),
+        ("triple fibonacci", "def f(n):\n    if n<=1: return n\n    return f(n-1)+f(n-2)+f(n-3)", 3),
+        ("merge sort (slice-based divide)", "def f(arr):\n    if len(arr)<=1: return arr\n    mid=len(arr)//2\n    left=f(arr[:mid])\n    right=f(arr[mid:])\n    return merge(left,right)\ndef merge(l,r):\n    return l+r", 0),
+        ("quicksort (filter-based divide)", "def f(arr):\n    if len(arr)<=1: return arr\n    p=arr[len(arr)//2]\n    l=[x for x in arr if x<p]\n    r=[x for x in arr if x>p]\n    return f(l)+f(r)", 0),
+        ("tree traversal (structural descent)", "def f(root):\n    if not root: return []\n    return f(root.left)+[root.val]+f(root.right)", 0),
+        ("single self-call (linear, not flagged)", "def f(n):\n    if n<=1: return 1\n    return n*f(n-1)", 0),
+    ]
+    for name, code, expected in py_cases:
+        m = PythonASTAnalyzer().analyze(code)
+        got = m["recursive_branching_risk"]
+        t.add(f"py recursion risk: {name}", "PASS" if got == expected else "FAIL", f"expected {expected}, got {got}")
+
+    cpp_cases = [
+        ("naive fibonacci", "int f(int n) { if (n <= 1) return n; return f(n - 1) + f(n - 2); }", 2),
+        ("index-based divide (merge-style)", "int f(std::vector<int>& arr, int s, int e) { if (s >= e) return 0; int m = (s + e) / 2; int c = 0; c += f(arr, s, m); c += f(arr, m + 1, e); return c; }", 0),
+        ("tree recursion (null-check descent)", "int f(Node* node) { if (node == nullptr) return 0; return f(node->left) + f(node->right); }", 0),
+    ]
+    for name, code, expected in cpp_cases:
+        m = CppTreeSitterAnalyzer().analyze(code)
+        got = m["recursive_branching_risk"]
+        t.add(f"cpp recursion risk: {name}", "PASS" if got == expected else "FAIL", f"expected {expected}, got {got}")
+
+    java_cases = [
+        ("naive fibonacci", "public int f(int n) { if (n <= 1) return n; return f(n - 1) + f(n - 2); }", 2),
+        ("tree recursion (null-check descent)", "public int f(Node node) { if (node == null) return 0; return f(node.left) + f(node.right); }", 0),
+        ("index-based divide (hypothetical)", "public int f(int[] arr, int s, int e) { int m = (s + e) / 2; return f(arr,s,m) + f(arr,m+1,e); }", 0),
+    ]
+    for name, code, expected in java_cases:
+        m = JavaTreeSitterAnalyzer().analyze(code)
+        got = m["recursive_branching_risk"]
+        t.add(f"java recursion risk: {name}", "PASS" if got == expected else "FAIL", f"expected {expected}, got {got}")
+
+    # --- element_swap_weight sanity (Python only) ---
+    swap_cases = [
+        ("bubble sort (real swap)", "def f(arr):\n    for i in range(len(arr)):\n        for j in range(len(arr)-i-1):\n            if arr[j]>arr[j+1]:\n                arr[j],arr[j+1]=arr[j+1],arr[j]\n    return arr", 1.0),
+        ("single assignment (no swap)", "def f(arr):\n    for i in range(len(arr)):\n        arr[i] = arr[i] * 2\n    return arr", 0.0),
+        ("non-subscript tuple assign (no swap)", "def f(a, b):\n    a, b = b, a\n    return a, b", 0.0),
+    ]
+    for name, code, expected in swap_cases:
+        m = PythonASTAnalyzer().analyze(code)
+        got = m["element_swap_weight"]
+        t.add(f"py element_swap_weight: {name}", "PASS" if got == expected else "FAIL", f"expected {expected}, got {got}")
+
+    # --- Full-corpus sweep: every template, all 3 languages, zero false
+    #     positives outside NEEDS_OPTIMIZATION for recursive_branching_risk,
+    #     and outside the one known bubble-sort template for element_swap_weight ---
+    for lang, templates, analyzer_cls in [
+        ('python', PYTHON_TEMPLATES, PythonASTAnalyzer),
+        ('cpp', CPP_TEMPLATES, CppTreeSitterAnalyzer),
+        ('java', JAVA_TEMPLATES, JavaTreeSitterAnalyzer),
+    ]:
+        false_positives = []
+        for bucket in ('EFFICIENT', 'MODERATE'):
+            for tmpl in templates[bucket]:
+                code = _fill_template_safe(tmpl)
+                try:
+                    m = analyzer_cls().analyze(code)
+                except Exception:
+                    continue
+                if m.get('recursive_branching_risk', 0) > 0:
+                    false_positives.append(('recursion', bucket, tmpl[:50]))
+                if lang == 'python' and m.get('element_swap_weight', 0.0) > 0:
+                    false_positives.append(('swap', bucket, tmpl[:50]))
+        if not false_positives:
+            t.add(f"{lang}: zero false positives on EFFICIENT/MODERATE corpus", "PASS")
+        else:
+            t.add(f"{lang}: zero false positives on EFFICIENT/MODERATE corpus", "FAIL", str(false_positives[:5]))
+
+
+def _fill_template_safe(template: str) -> str:
+    from profiler_main import _fill_template
+    return _fill_template(template, m=3, c=10, n=10, ch='a', key=7)
+
+
+def test_cpp_java_analyzers(t: TestResult):
+    """Tests for CppTreeSitterAnalyzer / JavaTreeSitterAnalyzer -- the real
+    parser-based replacements for the old text-heuristic. Previously there
+    were ZERO tests specifically for these two analyzers (a real gap noted
+    in HANDOFF.md section 7.6); this closes it.
+
+    Three things get checked, mirroring why each one was actually built:
+    1. Basic node-type coverage (loops/conditionals/defs/nesting), including
+       the for_range_loop / enhanced_for_statement regression -- both were
+       real bugs caught mid-build because the natural-sounding node name
+       ('for_statement') wasn't what tree-sitter actually uses for a
+       range-based/for-each loop.
+    2. KNOWN_COMPLEXITY stdlib-call weighting, including Java's chain-capping
+       (arr.stream().map().collect() must weight once, not three times) and
+       the HashSet copy-constructor argument check (empty ctor is O(1) and
+       must NOT be flagged; ctor with an argument copies n elements and must).
+    3. The exact cases the real-template audit found broken, as a locked-in
+       regression test -- see benchmarks/real_templates/selected_templates.py
+       and HANDOFF.md for the original findings these values came from.
+
+    A fourth, smaller check lives at the end of this function: an
+    integration pass confirming stdlib_complexity_weight flows correctly
+    through CodeProfiler.profile_cpp / profile_java / profile_python end to
+    end, not just at the analyzer-class level -- kept here rather than in
+    its own function since it directly follows from (2) above and shares
+    the same fixtures. Python's own KNOWN_COMPLEXITY support (list/set/
+    sorted/etc., see PythonASTAnalyzer.visit_Call) is a separate, real
+    Python-side implementation, not routed through this file's tree-sitter
+    analyzers -- included here for the same "confirm it reaches the
+    pipeline, not just the analyzer" reason.
+    """
+    print("  [CppTreeSitterAnalyzer / JavaTreeSitterAnalyzer] Node coverage, "
+          "stdlib weighting, regression cases...")
+
+    # --- C++: node-type coverage ---
+    cpp_cases = [
+        ("for_statement", "void f() { for (int i = 0; i < 10; i++) {} }", {'loops': 1, 'max_nesting_depth': 1}),
+        ("for_range_loop", "void f(std::vector<int>& a) { for (int x : a) {} }", {'loops': 1, 'max_nesting_depth': 1}),
+        ("while_statement", "void f() { while (true) break; }", {'loops': 1, 'max_nesting_depth': 1}),
+        ("do_statement", "void f() { int i = 0; do { i++; } while (i < 10); }", {'loops': 1, 'max_nesting_depth': 1}),
+        ("if_statement", "void f(int x) { if (x > 0) return; }", {'conditionals': 1}),
+        ("switch_statement", "void f(int x) { switch (x) { case 1: break; } }", {'conditionals': 1}),
+        ("function_definition", "int f() { return 1; }", {'function_defs': 1}),
+        ("class_specifier", "class C { int x; };", {'class_defs': 1}),
+        ("struct_specifier", "struct S { int x; };", {'class_defs': 1}),
+        ("call_expression", "void f() { g(); }", {'function_calls': 1}),
+        ("nested loops depth 2", "void f() { for (int i=0;i<10;i++) for (int j=0;j<10;j++) {} }", {'loops': 2, 'max_nesting_depth': 2}),
+        ("nested loops depth 3", "void f() { for(int i=0;i<1;i++) for(int j=0;j<1;j++) for(int k=0;k<1;k++) {} }", {'loops': 3, 'max_nesting_depth': 3}),
+    ]
+    for name, code, expected in cpp_cases:
+        try:
+            m = CppTreeSitterAnalyzer().analyze(code)
+            ok = True
+            for k, v in expected.items():
+                if m.get(k) != v:
+                    ok = False
+                    t.add(f"cpp_analyzer: {name}", "FAIL", f"Expected {k}={v}, got {m.get(k)}")
+                    break
+            if ok:
+                t.add(f"cpp_analyzer: {name}", "PASS")
+        except Exception as e:
+            t.add(f"cpp_analyzer: {name}", "FAIL", str(e))
+
+    # --- C++: KNOWN_COMPLEXITY stdlib weighting ---
+    cpp_stdlib_cases = [
+        ("std::sort", "void f(std::vector<int>& v) { std::sort(v.begin(), v.end()); }", 1.5),
+        ("std::reverse", "void f(std::vector<int>& v) { std::reverse(v.begin(), v.end()); }", 1.0),
+        ("std::count", "int f(const std::string& s) { return std::count(s.begin(), s.end(), 'a'); }", 1.0),
+        ("std::lower_bound", "void f(std::vector<int>& v) { std::lower_bound(v.begin(), v.end(), 1); }", 0.3),
+        ("no stdlib call", "int f(int x) { return x + 1; }", 0.0),
+        ("plain member call not in table", "void f(std::vector<int>& v) { v.push_back(1); }", 0.0),
+    ]
+    for name, code, expected_weight in cpp_stdlib_cases:
+        try:
+            m = CppTreeSitterAnalyzer().analyze(code)
+            if abs(m['stdlib_complexity_weight'] - expected_weight) < 1e-9:
+                t.add(f"cpp_stdlib: {name}", "PASS")
+            else:
+                t.add(f"cpp_stdlib: {name}", "FAIL", f"Expected {expected_weight}, got {m['stdlib_complexity_weight']}")
+        except Exception as e:
+            t.add(f"cpp_stdlib: {name}", "FAIL", str(e))
+
+    # --- C++: edge cases (must not raise -- tree-sitter is error-tolerant) ---
+    for name, code in EDGE_CASES_CPP:
+        try:
+            CppTreeSitterAnalyzer().analyze(code)
+            t.add(f"cpp_analyzer edge: {name}", "PASS")
+        except Exception as e:
+            t.add(f"cpp_analyzer edge: {name}", "FAIL", str(e))
+
+    # --- Java: node-type coverage ---
+    java_cases = [
+        ("for_statement", "class C { void f() { for (int i = 0; i < 10; i++) {} } }", {'loops': 1, 'max_nesting_depth': 1}),
+        ("enhanced_for_statement", "class C { void f(List<Integer> a) { for (int x : a) {} } }", {'loops': 1, 'max_nesting_depth': 1}),
+        ("while_statement", "class C { void f() { while (true) break; } }", {'loops': 1, 'max_nesting_depth': 1}),
+        ("do_statement", "class C { void f() { int i = 0; do { i++; } while (i < 10); } }", {'loops': 1, 'max_nesting_depth': 1}),
+        ("if_statement", "class C { void f(int x) { if (x > 0) return; } }", {'conditionals': 1}),
+        ("switch_expression", "class C { int f(int x) { return switch (x) { case 1 -> 1; default -> 0; }; } }", {'conditionals': 1}),
+        ("method_declaration", "class C { int f() { return 1; } }", {'function_defs': 1}),
+        ("constructor_declaration", "class C { C() { } }", {'function_defs': 1}),
+        ("class_declaration", "class C { }", {'class_defs': 1}),
+        ("interface_declaration", "interface I { void f(); }", {'class_defs': 1}),
+        ("method_invocation", "class C { void f() { g(); } }", {'function_calls': 1}),
+        ("nested loops depth 2", "class C { void f() { for(int i=0;i<10;i++) for(int j=0;j<10;j++) {} } }", {'loops': 2, 'max_nesting_depth': 2}),
+    ]
+    for name, code, expected in java_cases:
+        try:
+            m = JavaTreeSitterAnalyzer().analyze(code)
+            ok = True
+            for k, v in expected.items():
+                if m.get(k) != v:
+                    ok = False
+                    t.add(f"java_analyzer: {name}", "FAIL", f"Expected {k}={v}, got {m.get(k)}")
+                    break
+            if ok:
+                t.add(f"java_analyzer: {name}", "PASS")
+        except Exception as e:
+            t.add(f"java_analyzer: {name}", "FAIL", str(e))
+
+    # --- Java: KNOWN_COMPLEXITY stdlib weighting, incl. chain-capping and
+    #     the HashSet copy-constructor argument check ---
+    java_stdlib_cases = [
+        ("Collections.sort", "class C { void f(List<Integer> l) { Collections.sort(l); } }", 1.5),
+        ("list.contains", "class C { boolean f(List<Integer> l) { return l.contains(1); } }", 1.0),
+        ("stream chain (must cap at 1, not 2+)",
+         "class C { List<String> f(String[] w) { return Arrays.stream(w).map(String::toUpperCase).collect(Collectors.toList()); } }", 1.0),
+        ("HashSet ctor WITH argument (copies n elements -> O(n))",
+         "class C { Set<Integer> f(List<Integer> a) { return new HashSet<>(a); } }", 1.0),
+        ("HashSet ctor with NO argument (O(1) -- must NOT be flagged)",
+         "class C { Set<Integer> f() { return new HashSet<>(); } }", 0.0),
+        ("ArrayList ctor with NO argument (O(1))",
+         "class C { List<Integer> f() { return new ArrayList<>(); } }", 0.0),
+        ("ArrayList ctor WITH argument (O(n))",
+         "class C { List<Integer> f(List<Integer> a) { return new ArrayList<>(a); } }", 1.0),
+        ("no stdlib call", "class C { int f(int x) { return x + 1; } }", 0.0),
+    ]
+    for name, code, expected_weight in java_stdlib_cases:
+        try:
+            m = JavaTreeSitterAnalyzer().analyze(code)
+            if abs(m['stdlib_complexity_weight'] - expected_weight) < 1e-9:
+                t.add(f"java_stdlib: {name}", "PASS")
+            else:
+                t.add(f"java_stdlib: {name}", "FAIL", f"Expected {expected_weight}, got {m['stdlib_complexity_weight']}")
+        except Exception as e:
+            t.add(f"java_stdlib: {name}", "FAIL", str(e))
+
+    # --- Java: edge cases (must not raise) ---
+    for name, code in EDGE_CASES_JAVA:
+        try:
+            JavaTreeSitterAnalyzer().analyze(code)
+            t.add(f"java_analyzer edge: {name}", "PASS")
+        except Exception as e:
+            t.add(f"java_analyzer edge: {name}", "FAIL", str(e))
+
+    # --- Locked-in regression: the exact real-template-audit findings.
+    #     See benchmarks/real_templates/selected_templates.py and
+    #     HANDOFF.md section 6 -- these are the literal values that were
+    #     found broken under the old heuristic and verified fixed here.
+    #     If any of these regress, the real-template audit's documented
+    #     findings are no longer accurately reflected by the live analyzer.
+    regression_cases_cpp = [
+        ("cpp_string_reverse (was loops=0, invisible)",
+         "std::string f(const std::string& s) { std::string r = s; std::reverse(r.begin(), r.end()); return r; }",
+         {'loops': 0, 'stdlib_complexity_weight': 1.0}),
+        ("cpp_std_count (was loops=0, invisible)",
+         "int f(const std::string& s) { return std::count(s.begin(), s.end(), 'a'); }",
+         {'loops': 0, 'stdlib_complexity_weight': 1.0}),
+        ("cpp_single_pass_sum (for_range_loop fix)",
+         "int f(const std::vector<int>& arr) { int t = 0; for (int x : arr) t += x; return t; }",
+         {'loops': 1, 'stdlib_complexity_weight': 0.0}),
+        ("cpp_bubble_sort (control, unchanged)",
+         "void f(std::vector<int>& arr) { for (size_t i = 0; i < arr.size(); i++) for (size_t j = 0; j < arr.size() - i - 1; j++) if (arr[j] > arr[j + 1]) std::swap(arr[j], arr[j + 1]); }",
+         {'loops': 2, 'max_nesting_depth': 2}),
+        ("cpp_naive_fib (control, recursive, no loop)",
+         "int f(int n) { if (n <= 1) return n; return f(n - 1) + f(n - 2); }",
+         {'loops': 0}),
+        ("cpp_prime_sieve (control, loop structure located correctly)",
+         "std::vector<int> f(int n) { std::vector<bool> sieve(n + 1, true); std::vector<int> primes; for (int i = 2; i <= n; i++) { if (sieve[i]) { primes.push_back(i); for (int j = i * i; j <= n; j += i) sieve[j] = false; } } return primes; }",
+         {'loops': 2, 'max_nesting_depth': 2}),
+    ]
+    for name, code, expected in regression_cases_cpp:
+        try:
+            m = CppTreeSitterAnalyzer().analyze(code)
+            ok = True
+            for k, v in expected.items():
+                if abs(m.get(k, -999) - v) > 1e-9 if isinstance(v, float) else m.get(k) != v:
+                    ok = False
+                    t.add(f"regression: {name}", "FAIL", f"Expected {k}={v}, got {m.get(k)}")
+                    break
+            if ok:
+                t.add(f"regression: {name}", "PASS")
+        except Exception as e:
+            t.add(f"regression: {name}", "FAIL", str(e))
+
+    regression_cases_java = [
+        ("java_stream_upper (chain cap: must be 1.0, not 2.0)",
+         "public List<String> f(String[] words) { return Arrays.stream(words).map(String::toUpperCase).collect(Collectors.toList()); }",
+         {'loops': 0, 'stdlib_complexity_weight': 1.0}),
+        ("java_hashset_ctor (was invisible, now flagged)",
+         "public Set<Integer> f(List<Integer> arr) { return new HashSet<>(arr); }",
+         {'loops': 0, 'stdlib_complexity_weight': 1.0}),
+        ("java_single_pass_sum (enhanced_for_statement fix)",
+         "public int f(List<Integer> arr) { int t = 0; for (int x : arr) t += x; return t; }",
+         {'loops': 1, 'stdlib_complexity_weight': 0.0}),
+        ("java_bubble_sort (control, unchanged)",
+         "public void f(List<Integer> arr) { for (int i = 0; i < arr.size(); i++) for (int j = 0; j < arr.size() - i - 1; j++) if (arr.get(j) > arr.get(j + 1)) Collections.swap(arr, j, j + 1); }",
+         {'loops': 2, 'max_nesting_depth': 2}),
+        ("java_naive_fib (control, recursive, no loop)",
+         "public int f(int n) { if (n <= 1) return n; return f(n - 1) + f(n - 2); }",
+         {'loops': 0}),
+    ]
+    for name, code, expected in regression_cases_java:
+        try:
+            m = JavaTreeSitterAnalyzer().analyze(code)
+            ok = True
+            for k, v in expected.items():
+                if abs(m.get(k, -999) - v) > 1e-9 if isinstance(v, float) else m.get(k) != v:
+                    ok = False
+                    t.add(f"regression: {name}", "FAIL", f"Expected {k}={v}, got {m.get(k)}")
+                    break
+            if ok:
+                t.add(f"regression: {name}", "PASS")
+        except Exception as e:
+            t.add(f"regression: {name}", "FAIL", str(e))
+
+    # --- Integration: CodeProfiler.profile_cpp/profile_java/profile_python
+    #     must all surface stdlib_complexity_weight end-to-end. Python's
+    #     KNOWN_COMPLEXITY support was added this session (see
+    #     PythonASTAnalyzer.visit_Call) -- previously this always returned
+    #     0.0 for Python "by design, not implemented there"; that's no
+    #     longer true, so this integration test now exercises a snippet
+    #     that should surface a real nonzero weight, not just a snippet
+    #     that happens to have none.
+    profiler = CodeProfiler()
+    m_cpp = profiler.profile_cpp("void f(std::vector<int>& v) { std::sort(v.begin(), v.end()); }")
+    if 'stdlib_complexity_weight' in m_cpp and m_cpp['stdlib_complexity_weight'] == 1.5:
+        t.add("integration: profile_cpp surfaces stdlib_complexity_weight", "PASS")
+    else:
+        t.add("integration: profile_cpp surfaces stdlib_complexity_weight", "FAIL", str(m_cpp))
+
+    m_java = profiler.profile_java("public void f(List<Integer> l) { Collections.sort(l); }")
+    if 'stdlib_complexity_weight' in m_java and m_java['stdlib_complexity_weight'] == 1.5:
+        t.add("integration: profile_java surfaces stdlib_complexity_weight", "PASS")
+    else:
+        t.add("integration: profile_java surfaces stdlib_complexity_weight", "FAIL", str(m_java))
+
+    m_py_nonzero = profiler.profile_python("def f(lst):\n    return list(set(lst))")
+    if m_py_nonzero.get('stdlib_complexity_weight') == 2.0:
+        t.add("integration: profile_python surfaces stdlib_complexity_weight", "PASS")
+    else:
+        t.add("integration: profile_python surfaces stdlib_complexity_weight", "FAIL", str(m_py_nonzero))
+
+    m_py_zero = profiler.profile_python("def f(): return 1")
+    if m_py_zero.get('stdlib_complexity_weight') == 0.0:
+        t.add("integration: profile_python stdlib_complexity_weight=0.0 for no-stdlib-call code", "PASS")
+    else:
+        t.add("integration: profile_python stdlib_complexity_weight=0.0 for no-stdlib-call code", "FAIL", str(m_py_zero))
+
+
 def test_dataset_generator(t: TestResult):
     print("  [DatasetGenerator] Testing generation + metrics computation...")
 
-    # Test _generate_python_snippet
+    # Test _generate_program (python)
     for label in COMPLEXITY_LABELS:
         for _ in range(20):
-            code = _generate_python_snippet(label)
+            code, _sig = _generate_program('python', label)
             if not code or len(code) < 5:
                 t.add(f"Snippet gen: {label}", "FAIL", "Generated too short")
                 break
         else:
             t.add(f"Snippet gen: {label}", "PASS")
 
-    # Test _compute_synthetic_metrics
+    # Test _compute_features (python)
     for label in COMPLEXITY_LABELS:
-        code = _generate_python_snippet(label)
-        m = _compute_synthetic_metrics(code)
+        code, _sig = _generate_program('python', label)
+        m = _compute_features(code, 'python')
         required = ['execution_time_ms', 'memory_usage_kb', 'loop_depth', 'max_nesting_depth', 'function_calls', 'conditionals', 'complexity_score']
         missing = [k for k in required if k not in m]
         if missing:
@@ -572,6 +948,34 @@ def test_multiple_classifiers(t: TestResult):
             t.add("Hyperparameter tuning", "FAIL", "No best_params in results")
     except Exception as e:
         t.add("Hyperparameter tuning", "FAIL", str(e))
+
+    # Regression test: tune=False must actually apply cfg['grid']'s first
+    # configured point to the model, not silently fall through to
+    # unconfigured sklearn constructor defaults. (Bug found empirically:
+    # untuned MLPClassifier defaults on a small dataset landed within
+    # noise of this test's own 0.5 accuracy floor, passing or failing
+    # depending on dataset seed/size -- not a hyperparameter this project
+    # ever chose or validated.) Also confirms the shared CLASSIFIERS[...]
+    # ['model'] object isn't mutated by training (clone() must be used,
+    # not direct .set_params() on the shared instance).
+    try:
+        pre_train_params = dict(CLASSIFIERS['random_forest']['model'].get_params())
+        ml = MLPipeline(classifier_type='random_forest')
+        ml.train(generate_dataset(150, seed=1), tune=False, cv_folds=3)
+        expected_n_estimators = CLASSIFIERS['random_forest']['grid']['n_estimators'][0]
+        actual_n_estimators = ml.model.get_params()['n_estimators']
+        post_train_params = dict(CLASSIFIERS['random_forest']['model'].get_params())
+        if actual_n_estimators == expected_n_estimators:
+            t.add("tune=False applies grid's first point", "PASS")
+        else:
+            t.add("tune=False applies grid's first point", "FAIL",
+                  f"expected n_estimators={expected_n_estimators}, got {actual_n_estimators}")
+        if post_train_params == pre_train_params:
+            t.add("tune=False doesn't mutate shared CLASSIFIERS model", "PASS")
+        else:
+            t.add("tune=False doesn't mutate shared CLASSIFIERS model", "FAIL", "params changed after training")
+    except Exception as e:
+        t.add("tune=False applies grid's first point", "FAIL", str(e))
 
 
 def test_model_registry(t: TestResult):
@@ -898,6 +1302,79 @@ def test_print_report(t: TestResult):
         t.add("print_report sparse", "FAIL", str(e))
 
 
+def test_execution_sandbox(t: TestResult):
+    """Tests for execute_python_sandboxed() and the config-gated execution path.
+    Covers: normal execution, timeout, syntax/runtime errors, the
+    measured_execution flag in profile_python(), and edge cases.
+    """
+    print("  [execute_python_sandboxed] Sandbox + config-gated execution path...")
+
+    # 1. Normal execution returns a positive float
+    ms = execute_python_sandboxed("x = sum(range(100))")
+    if isinstance(ms, float) and ms >= 0.0:
+        t.add("sandbox: returns float", "PASS")
+    else:
+        t.add("sandbox: returns float", "FAIL", f"got {ms!r}")
+
+    # 2. Timeout returns None
+    ms = execute_python_sandboxed("import time; time.sleep(10)", timeout_seconds=0.3)
+    if ms is None:
+        t.add("sandbox: timeout → None", "PASS")
+    else:
+        t.add("sandbox: timeout → None", "FAIL", f"got {ms!r}")
+
+    # 3. Syntax error returns None (subprocess exits nonzero)
+    ms = execute_python_sandboxed("def f(:\n    pass")
+    if ms is None:
+        t.add("sandbox: syntax error → None", "PASS")
+    else:
+        t.add("sandbox: syntax error → None", "FAIL", f"got {ms!r}")
+
+    # 4. Runtime exception inside subprocess is caught by the harness, returns float
+    ms = execute_python_sandboxed("x = 1 / 0")
+    if isinstance(ms, float) and ms >= 0.0:
+        t.add("sandbox: runtime exception trapped → float", "PASS")
+    else:
+        t.add("sandbox: runtime exception trapped → float", "FAIL", f"got {ms!r}")
+
+    # 5. Empty code returns a (near-zero) float, not None
+    ms = execute_python_sandboxed("")
+    if isinstance(ms, float) and ms >= 0.0:
+        t.add("sandbox: empty code → float", "PASS")
+    else:
+        t.add("sandbox: empty code → float", "FAIL", f"got {ms!r}")
+
+    # 6. profile_python measured_execution=False when enable_execution not set
+    p = CodeProfiler()
+    m = p.profile("x = 1", "python")
+    if m.get("measured_execution") is False:
+        t.add("profile_python: measured_execution=False by default", "PASS")
+    else:
+        t.add("profile_python: measured_execution=False by default", "FAIL", str(m.get("measured_execution")))
+
+    # 7. profile_python measured_execution=True when enable_execution=true in config
+    import tempfile as _tf, os as _os
+    cfg_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.yaml')).read()
+    cfg_src = cfg_src.replace('enable_execution: false', 'enable_execution: true')
+    with _tf.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as fh:
+        fh.write(cfg_src)
+        tmp_cfg = fh.name
+    try:
+        config = ConfigManager(config_path=tmp_cfg)
+        p2 = CodeProfiler(config=config)
+        m2 = p2.profile("x = 1 + 1", "python")
+        if m2.get("measured_execution") is True:
+            t.add("profile_python: measured_execution=True when enabled", "PASS")
+        else:
+            t.add("profile_python: measured_execution=True when enabled", "FAIL", str(m2.get("measured_execution")))
+        if isinstance(m2.get("execution_time_ms"), float):
+            t.add("profile_python: execution_time_ms is float when measured", "PASS")
+        else:
+            t.add("profile_python: execution_time_ms is float when measured", "FAIL", str(type(m2.get("execution_time_ms"))))
+    finally:
+        _os.unlink(tmp_cfg)
+
+
 def test_main_function(t: TestResult):
     print("  [main()] Smoke test...")
     try:
@@ -923,6 +1400,10 @@ def run_all_tests():
 
     test_ast_analyzer(t)
     print()
+    test_recursion_and_swap_detection(t)
+    print()
+    test_cpp_java_analyzers(t)
+    print()
     test_dataset_generator(t)
     print()
     test_ml_pipeline(t)
@@ -938,6 +1419,8 @@ def run_all_tests():
     test_code_profiler(t)
     print()
     test_print_report(t)
+    print()
+    test_execution_sandbox(t)
     print()
     test_main_function(t)
 

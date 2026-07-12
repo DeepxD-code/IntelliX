@@ -6,6 +6,8 @@ profiling:
   memory_limit_mb: 512
   max_code_length_chars: 100000
   supported_languages: ["python", "cpp", "java"]
+  enable_execution: false  # Set true to measure real Python execution time (subprocess sandbox)
+                           # See profiler_main.execute_python_sandboxed() for security notes
 
 analysis:
   python:
@@ -14,11 +16,11 @@ analysis:
     track_lambda: true
     track_try_except: true
   cpp:
-    method: "heuristic"  # heuristic | regex | clang_ast (future)
+    method: "tree_sitter"  # tree_sitter (current, see cpp_analyzer.py) | heuristic (legacy, removed)
     track_arrays: true
     track_vectors: true
   java:
-    method: "heuristic"  # heuristic | asm_bytecode (future)
+    method: "tree_sitter"  # tree_sitter (current, see java_analyzer.py) | heuristic (legacy, removed)
     track_cyclomatic: true
     track_method_calls: true
 
