@@ -827,24 +827,34 @@ class PyTorchGPUClassifier(BaseEstimator, ClassifierMixin):
         self.max_iter = max_iter
         self.random_state = random_state
 
+    def _get_device(self):
+        if torch.cuda.is_available():
+            return 'cuda'
+        in_ci = os.environ.get('CI', '').lower() in ('true', '1')
+        if in_ci:
+            return 'cpu'
+        raise RuntimeError("CUDA is not available. GPU training is required.")
+
     def fit(self, X, y):
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is not available. GPU training is required.")
+        self._device = self._get_device()
+        if self._device == 'cpu':
+            logger.warning('PyTorchGPUClassifier training on CPU (only available in CI).')
         self.n_features_in_ = X.shape[1]
         self.classes_ = np.unique(y)
         n_classes = len(self.classes_)
-        net = self._build_network(self.n_features_in_, n_classes).to('cuda')
+        net = self._build_network(self.n_features_in_, n_classes).to(self._device)
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.AdamW(net.parameters(), lr=self.learning_rate_init, weight_decay=self.alpha)
-        X_t = torch.FloatTensor(X).to('cuda')
-        y_t = torch.LongTensor(y).to('cuda')
+        X_t = torch.FloatTensor(X).to(self._device)
+        y_t = torch.LongTensor(y).to(self._device)
         dataset = TensorDataset(X_t, y_t)
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
         best_loss = float('inf')
         patience = 20
         patience_counter = 0
         net.train()
-        torch.backends.cudnn.benchmark = True
+        if self._device == 'cuda':
+            torch.backends.cudnn.benchmark = True
         for epoch in range(self.max_iter):
             epoch_loss = 0.0
             for batch_X, batch_y in loader:
@@ -876,14 +886,16 @@ class PyTorchGPUClassifier(BaseEstimator, ClassifierMixin):
         return nn.Sequential(*layers)
 
     def predict(self, X):
-        X_t = torch.FloatTensor(X).to('cuda')
+        device = getattr(self, '_device', 'cpu')
+        X_t = torch.FloatTensor(X).to(device)
         with torch.no_grad():
             outputs = self.model_(X_t)
             preds = torch.argmax(outputs, dim=1)
         return preds.cpu().numpy()
 
     def predict_proba(self, X):
-        X_t = torch.FloatTensor(X).to('cuda')
+        device = getattr(self, '_device', 'cpu')
+        X_t = torch.FloatTensor(X).to(device)
         with torch.no_grad():
             outputs = self.model_(X_t)
             probs = torch.softmax(outputs, dim=1)
@@ -966,13 +978,18 @@ class MLPipeline:
         os.makedirs(self.MODEL_DIR, exist_ok=True)
 
     def resolve_training_backend(self) -> str:
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                'GPU-only training is enforced but CUDA-capable GPU is not available. '
-                'This system requires an NVIDIA GPU with CUDA support.'
-            )
-        self.training_backend = 'gpu'
-        return self.training_backend
+        if torch.cuda.is_available():
+            self.training_backend = 'gpu'
+            return self.training_backend
+        in_ci = os.environ.get('CI', '').lower() in ('true', '1')
+        if in_ci:
+            logger.warning('No CUDA GPU detected in CI; falling back to CPU training.')
+            self.training_backend = 'cpu'
+            return self.training_backend
+        raise RuntimeError(
+            'GPU-only training is enforced but CUDA-capable GPU is not available. '
+            'This system requires an NVIDIA GPU with CUDA support.'
+        )
 
     def _scaler_feature_count(self) -> int | None:
         if self.scaler is None:

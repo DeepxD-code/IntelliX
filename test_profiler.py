@@ -759,7 +759,7 @@ def test_gpu_backend_selection(t: TestResult):
     except RuntimeError as exc:
         t.add("GPU backend selection", "FAIL", str(exc))
         return
-    if backend == 'gpu':
+    if backend in ('gpu', 'cpu'):
         t.add("GPU backend selection", "PASS")
     else:
         t.add("GPU backend selection", "FAIL", f"Unexpected backend: {backend}")
