@@ -13,9 +13,6 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-import torch.optim as optim
 import yaml
 from sklearn.base import BaseEstimator, ClassifierMixin, clone
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
@@ -23,7 +20,6 @@ from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_sc
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, cross_val_score, train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
-from torch.utils.data import DataLoader, TensorDataset
 
 from cpp_analyzer import CppTreeSitterAnalyzer
 from java_analyzer import JavaTreeSitterAnalyzer
@@ -828,6 +824,15 @@ class PyTorchGPUClassifier(BaseEstimator, ClassifierMixin):
         self.random_state = random_state
 
     def _get_device(self):
+        try:
+            import torch
+        except ImportError:
+            in_ci = os.environ.get('CI', '').lower() in ('true', '1')
+            if in_ci:
+                raise RuntimeError("torch not installed in CI")
+            raise RuntimeError(
+                "PyTorch is required for GPU training. Install it with: pip install torch"
+            )
         if torch.cuda.is_available():
             return 'cuda'
         in_ci = os.environ.get('CI', '').lower() in ('true', '1')
@@ -836,6 +841,10 @@ class PyTorchGPUClassifier(BaseEstimator, ClassifierMixin):
         raise RuntimeError("CUDA is not available. GPU training is required.")
 
     def fit(self, X, y):
+        import torch
+        import torch.nn as nn
+        import torch.optim as optim
+        from torch.utils.data import DataLoader, TensorDataset
         self._device = self._get_device()
         if self._device == 'cpu':
             logger.warning('PyTorchGPUClassifier training on CPU (only available in CI).')
@@ -876,6 +885,7 @@ class PyTorchGPUClassifier(BaseEstimator, ClassifierMixin):
         return self
 
     def _build_network(self, n_features, n_classes):
+        import torch.nn as nn
         layers = []
         prev = n_features
         act = nn.ReLU if self.activation == 'relu' else nn.Tanh
@@ -886,6 +896,7 @@ class PyTorchGPUClassifier(BaseEstimator, ClassifierMixin):
         return nn.Sequential(*layers)
 
     def predict(self, X):
+        import torch
         device = getattr(self, '_device', 'cpu')
         X_t = torch.FloatTensor(X).to(device)
         with torch.no_grad():
@@ -894,6 +905,7 @@ class PyTorchGPUClassifier(BaseEstimator, ClassifierMixin):
         return preds.cpu().numpy()
 
     def predict_proba(self, X):
+        import torch
         device = getattr(self, '_device', 'cpu')
         X_t = torch.FloatTensor(X).to(device)
         with torch.no_grad():
@@ -960,6 +972,16 @@ CLASSIFIERS = {
     },
 }
 
+# Remove neural_network classifier at import time if PyTorch is not installed,
+# so tests and iteration over CLASSIFIERS don't attempt GPU-only training on
+# a system without torch (e.g. CI runners). The lazy import inside
+# PyTorchGPUClassifier._get_device / MLPipeline.resolve_training_backend
+# provides a second line of defence with a clear error message.
+try:
+    import torch  # noqa: F401
+except ImportError:
+    CLASSIFIERS.pop('neural_network', None)
+
 
 class MLPipeline:
     """Train, evaluate, persist, and predict with ML model (supports multiple classifiers)."""
@@ -978,6 +1000,17 @@ class MLPipeline:
         os.makedirs(self.MODEL_DIR, exist_ok=True)
 
     def resolve_training_backend(self) -> str:
+        try:
+            import torch
+        except ImportError:
+            in_ci = os.environ.get('CI', '').lower() in ('true', '1')
+            if in_ci:
+                logger.warning('torch not installed in CI; using CPU training backend.')
+                self.training_backend = 'cpu'
+                return self.training_backend
+            raise RuntimeError(
+                'GPU-only training requires PyTorch. Install it with: pip install torch'
+            )
         if torch.cuda.is_available():
             self.training_backend = 'gpu'
             return self.training_backend

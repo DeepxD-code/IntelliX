@@ -16,8 +16,7 @@ mcp==1.28.0
 tree-sitter==0.25.2
 tree-sitter-cpp==0.23.4
 tree-sitter-java==0.23.5
-# GPU-accelerated training backend -- provides CUDA-aware tensor ops and
-# neural-network building blocks used by PyTorchGPUClassifier. The pip
-# distribution bundles the CUDA runtime; no separate CUDA Toolkit install
-# is required on a system with a supported NVIDIA driver.
-torch>=2.0.0
+# GPU-accelerated training backend (optional for local GPU, not needed in CI).
+# Install manually: pip install torch
+# PyTorchGPUClassifier and CUDA detection use a lazy import -- the package
+# loads and runs fine without it, falling back gracefully on CPU-only systems.
