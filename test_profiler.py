@@ -752,6 +752,32 @@ def test_dataset_generator(t: TestResult):
         t.add("Dataset determinism", "FAIL", "Different results with same seed")
 
 
+def test_gpu_backend_selection(t: TestResult):
+    ml = MLPipeline()
+    try:
+        backend = ml.resolve_training_backend()
+    except RuntimeError as exc:
+        t.add("GPU backend selection", "FAIL", str(exc))
+        return
+    if backend == 'gpu':
+        t.add("GPU backend selection", "PASS")
+    else:
+        t.add("GPU backend selection", "FAIL", f"Unexpected backend: {backend}")
+
+
+def test_expanded_feature_set(t: TestResult):
+    required_features = {
+        'function_defs', 'class_defs', 'lambda_functions', 'try_except_blocks',
+        'list_comprehensions', 'imports', 'assignments', 'returns', 'with_blocks',
+        'decorators', 'yield_count', 'attribute_accesses', 'string_literals', 'numeric_literals'
+    }
+    missing = sorted(required_features - set(FEATURE_COLUMNS))
+    if missing:
+        t.add("Expanded feature set", "FAIL", f"Missing: {missing}")
+    else:
+        t.add("Expanded feature set", "PASS")
+
+
 def test_ml_pipeline(t: TestResult):
     print("  [MLPipeline] Training, prediction, save, load...")
 
@@ -1377,11 +1403,23 @@ def test_execution_sandbox(t: TestResult):
 
 def test_main_function(t: TestResult):
     print("  [main()] Smoke test...")
+    import yaml as _yaml, tempfile as _tf, os as _os
+    cfg = ConfigManager().config
+    cfg['dataset']['n_samples'] = 60
+    cfg['ml_model']['auto_select_best'] = False
+    cfg['ml_model']['hyperparameter_tuning'] = False
+    with _tf.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as _fh:
+        _yaml.dump(cfg, _fh)
+        tmp = _fh.name
     try:
+        _os.environ['CONFIG_PATH'] = tmp
         main()
         t.add("main()", "PASS")
     except Exception as e:
         t.add("main()", "FAIL", str(e))
+    finally:
+        _os.unlink(tmp)
+        _os.environ.pop('CONFIG_PATH', None)
 
 
 # =============================================================================

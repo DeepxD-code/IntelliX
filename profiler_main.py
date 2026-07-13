@@ -13,14 +13,17 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import yaml
-from sklearn.base import clone
+from sklearn.base import BaseEstimator, ClassifierMixin, clone
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, cross_val_score, train_test_split
-from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
+from torch.utils.data import DataLoader, TensorDataset
 
 from cpp_analyzer import CppTreeSitterAnalyzer
 from java_analyzer import JavaTreeSitterAnalyzer
@@ -235,6 +238,9 @@ class PythonASTAnalyzer(ast.NodeVisitor):
             'loops': 0, 'function_calls': 0, 'conditionals': 0,
             'max_nesting_depth': 0, 'function_defs': 0, 'class_defs': 0,
             'list_comprehensions': 0, 'lambda_functions': 0, 'try_except_blocks': 0,
+            'imports': 0, 'assignments': 0, 'returns': 0, 'with_blocks': 0,
+            'decorators': 0, 'yield_count': 0, 'attribute_accesses': 0,
+            'string_literals': 0, 'numeric_literals': 0,
             'stdlib_complexity_weight': 0.0, 'recursive_branching_risk': 0,
             'element_swap_weight': 0.0,
         }
@@ -265,6 +271,7 @@ class PythonASTAnalyzer(ast.NodeVisitor):
     def visit_If(self, node):
         self.metrics['conditionals'] += 1; self.generic_visit(node)
     def visit_Assign(self, node):
+        self.metrics['assignments'] += 1
         # Detects arr[i], arr[j] = arr[j], arr[i]-style in-place element
         # swaps: a tuple assignment where every target is a Subscript.
         # Structurally distinct from a plain single-value assignment, and a
@@ -302,6 +309,28 @@ class PythonASTAnalyzer(ast.NodeVisitor):
         self.metrics['lambda_functions'] += 1; self.generic_visit(node)
     def visit_Try(self, node):
         self.metrics['try_except_blocks'] += 1; self.generic_visit(node)
+    def visit_Import(self, node):
+        self.metrics['imports'] += len(node.names); self.generic_visit(node)
+    def visit_ImportFrom(self, node):
+        self.metrics['imports'] += len(node.names); self.generic_visit(node)
+    def visit_Return(self, node):
+        self.metrics['returns'] += 1; self.generic_visit(node)
+    def visit_With(self, node):
+        self.metrics['with_blocks'] += 1; self.generic_visit(node)
+    def visit_Decorator(self, node):
+        self.metrics['decorators'] += 1; self.generic_visit(node)
+    def visit_Yield(self, node):
+        self.metrics['yield_count'] += 1; self.generic_visit(node)
+    def visit_YieldFrom(self, node):
+        self.metrics['yield_count'] += 1; self.generic_visit(node)
+    def visit_Attribute(self, node):
+        self.metrics['attribute_accesses'] += 1; self.generic_visit(node)
+    def visit_Constant(self, node):
+        if isinstance(node.value, str):
+            self.metrics['string_literals'] += 1
+        elif isinstance(node.value, (int, float, complex)):
+            self.metrics['numeric_literals'] += 1
+        self.generic_visit(node)
 
     def _visit_comp(self, node, kind: str):
         self.metrics['list_comprehensions'] += 1
@@ -719,6 +748,19 @@ def _compute_features(code: str, lang: str) -> dict[str, float]:
         'stdlib_complexity_weight': metrics.get('stdlib_complexity_weight', 0.0),
         'recursive_branching_risk': metrics.get('recursive_branching_risk', 0),
         'element_swap_weight': metrics.get('element_swap_weight', 0.0),
+        'function_defs': metrics.get('function_defs', 0),
+        'class_defs': metrics.get('class_defs', 0),
+        'lambda_functions': metrics.get('lambda_functions', 0),
+        'try_except_blocks': metrics.get('try_except_blocks', 0),
+        'imports': metrics.get('imports', 0),
+        'assignments': metrics.get('assignments', 0),
+        'returns': metrics.get('returns', 0),
+        'with_blocks': metrics.get('with_blocks', 0),
+        'decorators': metrics.get('decorators', 0),
+        'yield_count': metrics.get('yield_count', 0),
+        'attribute_accesses': metrics.get('attribute_accesses', 0),
+        'string_literals': metrics.get('string_literals', 0),
+        'numeric_literals': metrics.get('numeric_literals', 0),
         'language': LANGUAGE_ENCODE.get(lang, 0.0),
     }
 
@@ -772,10 +814,93 @@ def generate_dataset(n_samples: int = 1500, seed: int = 42) -> pd.DataFrame:
 # 3. ML PIPELINE — Multiple classifiers, GridSearchCV, ModelRegistry
 # =============================================================================
 
+
+class PyTorchGPUClassifier(BaseEstimator, ClassifierMixin):
+    def __init__(self, hidden_layer_sizes=(128, 64), activation='relu',
+                 learning_rate_init=0.001, alpha=0.0001, batch_size=64,
+                 max_iter=2000, random_state=42):
+        self.hidden_layer_sizes = hidden_layer_sizes
+        self.activation = activation
+        self.learning_rate_init = learning_rate_init
+        self.alpha = alpha
+        self.batch_size = batch_size
+        self.max_iter = max_iter
+        self.random_state = random_state
+
+    def fit(self, X, y):
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available. GPU training is required.")
+        self.n_features_in_ = X.shape[1]
+        self.classes_ = np.unique(y)
+        n_classes = len(self.classes_)
+        net = self._build_network(self.n_features_in_, n_classes).to('cuda')
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.AdamW(net.parameters(), lr=self.learning_rate_init, weight_decay=self.alpha)
+        X_t = torch.FloatTensor(X).to('cuda')
+        y_t = torch.LongTensor(y).to('cuda')
+        dataset = TensorDataset(X_t, y_t)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        best_loss = float('inf')
+        patience = 20
+        patience_counter = 0
+        net.train()
+        torch.backends.cudnn.benchmark = True
+        for epoch in range(self.max_iter):
+            epoch_loss = 0.0
+            for batch_X, batch_y in loader:
+                optimizer.zero_grad()
+                outputs = net(batch_X)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+            if epoch_loss < best_loss:
+                best_loss = epoch_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    break
+        net.eval()
+        self.model_ = net
+        return self
+
+    def _build_network(self, n_features, n_classes):
+        layers = []
+        prev = n_features
+        act = nn.ReLU if self.activation == 'relu' else nn.Tanh
+        for h in self.hidden_layer_sizes:
+            layers.extend([nn.Linear(prev, h), act(), nn.BatchNorm1d(h), nn.Dropout(0.2)])
+            prev = h
+        layers.append(nn.Linear(prev, n_classes))
+        return nn.Sequential(*layers)
+
+    def predict(self, X):
+        X_t = torch.FloatTensor(X).to('cuda')
+        with torch.no_grad():
+            outputs = self.model_(X_t)
+            preds = torch.argmax(outputs, dim=1)
+        return preds.cpu().numpy()
+
+    def predict_proba(self, X):
+        X_t = torch.FloatTensor(X).to('cuda')
+        with torch.no_grad():
+            outputs = self.model_(X_t)
+            probs = torch.softmax(outputs, dim=1)
+        return probs.cpu().numpy()
+
+    def __sklearn_clone__(self):
+        return PyTorchGPUClassifier(**self.get_params())
+
+
 FEATURE_COLUMNS = [
     'execution_time_ms', 'memory_usage_kb', 'loop_depth',
     'max_nesting_depth', 'function_calls', 'conditionals', 'complexity_score',
-    'stdlib_complexity_weight', 'recursive_branching_risk', 'element_swap_weight', 'language'
+    'stdlib_complexity_weight', 'recursive_branching_risk', 'element_swap_weight',
+    'function_defs', 'class_defs', 'lambda_functions', 'try_except_blocks',
+    'imports', 'assignments', 'returns', 'with_blocks', 'decorators',
+    'yield_count', 'attribute_accesses', 'string_literals', 'numeric_literals',
+    'language'
 ]
 
 LANGUAGE_ENCODE = {'python': 0.0, 'cpp': 1.0, 'java': 2.0}
@@ -812,7 +937,7 @@ CLASSIFIERS = {
         }
     },
     'neural_network': {
-        'model': MLPClassifier(max_iter=2000, random_state=42, early_stopping=True),
+        'model': PyTorchGPUClassifier(max_iter=200, random_state=42),
         'grid': {
             'hidden_layer_sizes': [(64,), (128,), (64, 32), (128, 64)],
             'activation': ['relu', 'tanh'],
@@ -837,9 +962,50 @@ class MLPipeline:
         self.classifier_type = classifier_type
         self.label_map = {'EFFICIENT': 0, 'MODERATE': 1, 'NEEDS_OPTIMIZATION': 2}
         self.inv_label_map = {v: k for k, v in self.label_map.items()}
+        self.training_backend = 'cpu'
         os.makedirs(self.MODEL_DIR, exist_ok=True)
 
+    def resolve_training_backend(self) -> str:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                'GPU-only training is enforced but CUDA-capable GPU is not available. '
+                'This system requires an NVIDIA GPU with CUDA support.'
+            )
+        self.training_backend = 'gpu'
+        return self.training_backend
+
+    def _scaler_feature_count(self) -> int | None:
+        if self.scaler is None:
+            return None
+        for attr in ('n_features_in_',):
+            value = getattr(self.scaler, attr, None)
+            if value is None:
+                continue
+            try:
+                if hasattr(value, 'shape'):
+                    return int(value.shape[0])
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        if hasattr(self.scaler, 'mean_'):
+            try:
+                return int(len(self.scaler.mean_))
+            except TypeError:
+                pass
+        return None
+
+    def _ensure_compatible_features(self) -> None:
+        expected = len(FEATURE_COLUMNS)
+        actual = self._scaler_feature_count()
+        if actual is None:
+            return
+        if actual != expected:
+            raise ValueError(
+                f"Saved model expects {actual} features, but current pipeline expects {expected}."
+            )
+
     def train(self, df: pd.DataFrame, tune: bool = True, cv_folds: int = 5) -> dict[str, float]:
+        backend = self.resolve_training_backend()
         X = df[FEATURE_COLUMNS].values
         y = df['label_encoded'].values
 
@@ -854,7 +1020,8 @@ class MLPipeline:
         cfg = CLASSIFIERS.get(self.classifier_type, CLASSIFIERS['random_forest'])
 
         if tune:
-            gs = GridSearchCV(cfg['model'], cfg['grid'], cv=3, scoring='accuracy', n_jobs=-1, verbose=0)
+            is_gpu_model = isinstance(cfg['model'], PyTorchGPUClassifier)
+            gs = GridSearchCV(cfg['model'], cfg['grid'], cv=3, scoring='accuracy', n_jobs=1 if is_gpu_model else -1, verbose=0)
             gs.fit(X_train_scaled, y_train)
             self.model = gs.best_estimator_
             best_params = gs.best_params_
@@ -898,12 +1065,16 @@ class MLPipeline:
             'n_train': len(X_train),
             'n_test': len(X_test),
         }
-        logger.info(f"Trained {self.classifier_type}: acc={self.accuracy:.4f}, f1={self.f1:.4f}, params={best_params}")
+        logger.info(
+            f"Trained {self.classifier_type} on {backend} backend: acc={self.accuracy:.4f}, "
+            f"f1={self.f1:.4f}, params={best_params}"
+        )
         return results
 
     def predict(self, metrics: dict[str, float]) -> tuple[str, float, dict[str, float]]:
         if self.model is None or self.scaler is None:
             raise RuntimeError("Model not trained or loaded.")
+        self._ensure_compatible_features()
         raw = {}
         for c in FEATURE_COLUMNS:
             v = metrics.get(c, 0.0)
@@ -970,6 +1141,7 @@ class MLPipeline:
                 pipeline.accuracy = meta.get('accuracy', 0.0)
                 pipeline.f1 = meta.get('f1_score', 0.0)
                 pipeline.classifier_type = meta.get('classifier_type', 'unknown')
+        pipeline._ensure_compatible_features()
         return pipeline
 
 
@@ -1251,7 +1423,7 @@ class CodeProfiler:
                     'probabilities': {k: round(v, 4) for k, v in probabilities.items()},
                 }
                 result['recommendations'] = generate_recommendations(metrics, label, self.config)
-            except RuntimeError:
+            except (RuntimeError, ValueError):
                 result['ml_prediction'] = {'label': 'UNKNOWN', 'confidence': 0.0}
                 result['recommendations'] = []
         else:

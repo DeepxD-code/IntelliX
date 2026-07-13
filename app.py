@@ -142,28 +142,37 @@ def init_backend():
             'f1_score': ml_pipeline.f1,
             'classifier': ml_pipeline.classifier_type,
         }
-    except (FileNotFoundError, Exception) as e:
-        # NOTE: this fallback path is intentionally slow (full GridSearchCV
-        # per config.yaml's hyperparameter_tuning=true) and should not run
-        # at request-serving time in production. The Dockerfile now trains
-        # and bakes a model in at build time specifically so this branch is
-        # never hit on a real deploy. It's kept as a graceful fallback for
-        # local/dev use without Docker.
-        logger.info(f"No saved model found ({e}). Training new model...")
-        n = config.get('dataset.n_samples', 500)
-        ctype = config.get('ml_model.classifier_type', 'random_forest')
-        df = generate_dataset(n, seed=config.get('dataset.seed', 42))
-        ml_pipeline = MLPipeline(classifier_type=ctype)
-        results = ml_pipeline.train(df, tune=config.get('ml_model.hyperparameter_tuning', True))
-        version = ml_pipeline.save()
-        model_info = {
-            'accuracy': results['test_accuracy'],
-            'f1_score': results['test_f1_weighted'],
-            'cv_accuracy': results['cv_accuracy_mean'],
-            'classifier': ctype,
-            'version': version,
-        }
-        logger.info(f"Trained {ctype}, acc={results['test_accuracy']:.4f}")
+    except (FileNotFoundError, RuntimeError) as e:
+        if isinstance(e, RuntimeError) and 'GPU-only training' in str(e):
+            logger.warning(f"GPU-only training unavailable ({e}). Continuing without an ML model.")
+            ml_pipeline = None
+            model_info = {'accuracy': 0.0, 'f1_score': 0.0, 'classifier': 'disabled'}
+        else:
+            # NOTE: this fallback path is intentionally slow (full GridSearchCV
+            # per config.yaml's hyperparameter_tuning=true) and should not run
+            # at request-serving time in production. The Dockerfile now trains
+            # and bakes a model in at build time specifically so this branch is
+            # never hit on a real deploy. It's kept as a graceful fallback for
+            # local/dev use without Docker.
+            logger.info(f"No saved model found ({e}). Training new model...")
+            n = config.get('dataset.n_samples', 500)
+            ctype = config.get('ml_model.classifier_type', 'random_forest')
+            df = generate_dataset(n, seed=config.get('dataset.seed', 42))
+            ml_pipeline = MLPipeline(classifier_type=ctype)
+            results = ml_pipeline.train(df, tune=config.get('ml_model.hyperparameter_tuning', True))
+            version = ml_pipeline.save()
+            model_info = {
+                'accuracy': results['test_accuracy'],
+                'f1_score': results['test_f1_weighted'],
+                'cv_accuracy': results['cv_accuracy_mean'],
+                'classifier': ctype,
+                'version': version,
+            }
+            logger.info(f"Trained {ctype}, acc={results['test_accuracy']:.4f}")
+    except Exception as e:
+        logger.warning(f"Model initialization failed ({e}); continuing without an ML model.")
+        ml_pipeline = None
+        model_info = {'accuracy': 0.0, 'f1_score': 0.0, 'classifier': 'disabled'}
 
     profiler = CodeProfiler(ml_pipeline, config)
 
